@@ -1,0 +1,174 @@
+{% extends "base.html" %}
+{% block title %}选股池 -- AI 量化系统{% endblock %}
+
+{% block content %}
+<div x-data="poolApp()" x-init="init()">
+
+    <div class="flex items-center justify-between mb-6">
+        <div>
+            <h1 class="text-2xl font-bold text-gray-900 mb-1">选股池</h1>
+            <p class="text-sm text-gray-600">各策略独立选股，统一展示入选股票（无默认策略），结果持久化到数据库</p>
+            <p class="text-xs text-gray-400 mt-1">
+                <template x-if="summary.strategies > 0">
+                    <span>共 <span class="font-semibold" x-text="summary.strategies"></span> 个策略 ·
+                        <span class="font-semibold" x-text="summary.total"></span> 只入选 ·
+                        交易日 <span class="font-mono" x-text="trade_date || '-'"></span></span>
+                </template>
+                <template x-if="selection_run_at"> · 选股时间 <span class="font-mono" x-text="selection_run_at"></span></template>
+            </p>
+        </div>
+        <div class="flex items-center gap-3">
+            <button class="btn btn-secondary btn-sm" @click="refresh()" :disabled="loading">
+                <span x-show="!loading">刷新</span>
+                <span x-show="loading">加载中...</span>
+            </button>
+        </div>
+    </div>
+
+    <!-- 汇总卡片 -->
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+        <div class="bg-white rounded-lg border border-gray-200 p-4">
+            <div class="text-xs text-gray-500">策略数量</div>
+            <div class="text-2xl font-bold text-gray-900 mt-1" x-text="summary.strategies || 0"></div>
+        </div>
+        <div class="bg-white rounded-lg border border-gray-200 p-4">
+            <div class="text-xs text-gray-500">入选总数</div>
+            <div class="text-2xl font-bold text-indigo-600 mt-1" x-text="summary.total || 0"></div>
+        </div>
+        <div class="bg-white rounded-lg border border-gray-200 p-4">
+            <div class="text-xs text-gray-500">启用策略</div>
+            <div class="text-2xl font-bold text-green-600 mt-1" x-text="enabledCount"></div>
+        </div>
+        <div class="bg-white rounded-lg border border-gray-200 p-4">
+            <div class="text-xs text-gray-500">最近选股</div>
+            <div class="text-xl font-bold text-gray-900 mt-1" x-text="trade_date || '-'"></div>
+        </div>
+    </div>
+
+    <!-- 按策略筛选 -->
+    <div class="flex items-center gap-2 mb-3" x-show="rows.length > 0">
+        <span class="text-sm text-gray-600">按策略筛选：</span>
+        <select x-model="filterStrategy"
+                class="border border-gray-300 rounded-md text-sm px-3 py-1.5 bg-white focus:outline-none focus:ring-2 focus:ring-indigo-500">
+            <option value="">全部策略</option>
+            <template x-for="s in strategyOptions" :key="s.key">
+                <option :value="s.key" x-text="s.label"></option>
+            </template>
+        </select>
+        <span class="text-xs text-gray-400" x-text="rows.length > 0 ? ('当前显示 ' + filteredRows().length + ' 只') : ''"></span>
+    </div>
+
+    <!-- 空状态 -->
+    <template x-if="rows.length === 0 && !loading">
+        <div class="bg-white rounded-lg border border-dashed border-gray-300 text-gray-400 text-sm py-16 text-center">
+            暂无选股池数据 — 请在「策略」页面配置多策略并执行选股，或等待定时选股（09:25 / 14:35）自动生成
+        </div>
+    </template>
+
+    <!-- 筛选后无匹配 -->
+    <template x-if="rows.length > 0 && filteredRows().length === 0">
+        <div class="bg-white rounded-lg border border-dashed border-gray-300 text-gray-400 text-sm py-10 text-center">
+            当前策略下暂无入选个股
+        </div>
+    </template>
+
+    <!-- 统一入选股票表格 -->
+    <div class="bg-white rounded-lg border border-gray-200 overflow-hidden" x-show="filteredRows().length > 0">
+        <table class="app-table">
+            <thead>
+                <tr>
+                    <th>股票代码</th>
+                    <th>股票名称</th>
+                    <th>入选策略</th>
+                    <th>开盘涨幅</th>
+                    <th>当前涨幅</th>
+                    <th>入选时间</th>
+                    <th>入选理由</th>
+                </tr>
+            </thead>
+            <tbody>
+                <template x-for="r in filteredRows()" :key="r.code + r.strategy">
+                    <tr>
+                        <td class="font-mono" x-text="r.code"></td>
+                        <td x-text="r.name"></td>
+                        <td>
+                            <span class="badge badge-info text-xs" x-text="r.strategy_label || r.strategy"></span>
+                        </td>
+                        <td class="text-xs font-mono" x-html="pctHtml(r.open_pct)"></td>
+                        <td class="text-xs font-mono" x-html="pctHtml(r.cur_pct)"></td>
+                        <td class="text-xs text-gray-500 font-mono" x-text="r.selected_at || r.trade_date || '-'"></td>
+                        <td class="text-xs text-gray-500" x-text="r.reason || ''"></td>
+                    </tr>
+                </template>
+            </tbody>
+        </table>
+    </div>
+
+</div>
+
+<script>
+function poolApp() {
+    return {
+        rows: [],
+        strategyOptions: [],
+        filterStrategy: '',
+        summary: { strategies: 0, total: 0 },
+        enabledCount: 0,
+        selection_run_at: '',
+        trade_date: '',
+        loading: false,
+        filteredRows() {
+            if (!this.filterStrategy) return this.rows;
+            return this.rows.filter(r => r.strategy === this.filterStrategy);
+        },
+        pctHtml(v) {
+            if (v === null || v === undefined || v === '') return '<span class="text-gray-300">-</span>';
+            const n = Number(v);
+            if (isNaN(n)) return '<span class="text-gray-300">-</span>';
+            const cls = n > 0 ? 'text-red-600' : (n < 0 ? 'text-green-600' : 'text-gray-500');
+            return `<span class="${cls}">${n > 0 ? '+' : ''}${n.toFixed(2)}%</span>`;
+        },
+        async init() {
+            await this.refresh();
+        },
+        async refresh() {
+            this.loading = true;
+            const data = await App.get('/api/pool/list');
+            if (data) {
+                const groups = data.groups || [];
+                const flat = [];
+                groups.forEach(g => {
+                    (g.rows || []).forEach(r => {
+                        flat.push({
+                            code: r.code || '',
+                            name: r.name || '',
+                            strategy: g.strategy || '',
+                            strategy_label: g.label || g.strategy || '',
+                            trade_date: r.trade_date || g.trade_date || data.trade_date || '',
+                            selected_at: r.selected_at || '',
+                            open_pct: r.open_pct,
+                            cur_pct: r.cur_pct,
+                            reason: r.reason || '',
+                        });
+                    });
+                });
+                this.rows = flat;
+                this.strategyOptions = groups.map(g => ({ key: g.strategy || '', label: g.label || g.strategy || '' }));
+                if (this.filterStrategy && !this.strategyOptions.some(s => s.key === this.filterStrategy)) {
+                    this.filterStrategy = '';
+                }
+                this.summary = data.summary || { strategies: 0, total: 0 };
+                this.total_selected = data.total_selected || 0;
+                if ((this.summary.total || 0) === 0 && this.total_selected) {
+                    this.summary.total = this.total_selected;
+                }
+                this.enabledCount = groups.filter(g => g.enabled).length;
+                this.selection_run_at = data.selection_run_at || '';
+                this.trade_date = data.trade_date || '';
+            }
+            this.loading = false;
+        },
+    }
+}
+</script>
+{% endblock %}

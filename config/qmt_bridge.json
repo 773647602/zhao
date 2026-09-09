@@ -1,0 +1,13 @@
+{
+  "qmt_path": "D:\\国金证券QMT交易端\\",
+  "account_id": "8890809055",
+  "account_type": "STOCK",
+  "transport": "zmq",
+  "host": "127.0.0.1",
+  "port": 15563,
+  "db": 5,
+  "username": "",
+  "password": "568815",
+  "allow_order_methods": true,
+  "qmt_python_dir": "D:\\国金证券QMT交易端\\bin.x64"
+}

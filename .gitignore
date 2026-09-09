@@ -1,0 +1,28 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+
+# ===== 敏感配置（含账号/密钥/密码，绝不可入库）=====
+.env
+*.env
+
+# ===== 运行时产物 =====
+outputs/
+*.log
+*.err
+config/watch_pool.yaml
+bitspace_keywords.txt
+
+# ===== 临时诊断/探针脚本（按需忽略）=====
+_probe*.py
+_inspect_db.py
+_t_api.py
+_verify_*.py
+
+# ===== IDE =====
+.idea/
+.vscode/

@@ -1,0 +1,219 @@
+{% extends "base.html" %}
+{% block title %}QMT 配置 -- AI 量化系统{% endblock %}
+
+{% block content %}
+<div x-data="qmtApp()" x-init="init()">
+
+    <!-- 使用说明 modal -->
+    <div class="modal-overlay" x-show="showHelp" x-cloak @click.self="showHelp = false">
+        <div class="modal-card">
+            <div class="modal-header">
+                <div class="modal-title">QMT 配置 -- 使用说明</div>
+                <button class="modal-close" @click="showHelp = false">×</button>
+            </div>
+            <div class="modal-body">
+                <h4>这个 Tab 是干嘛的</h4>
+                <p>配置并测试"大 QMT 桥接"的连接参数。保存后按这里的传输方式 / 地址 / 端口
+                   去连 QMT 里加载的桥策略；"测试连通"会真实 ping 一次。</p>
+
+                <h4>字段说明</h4>
+                <ul>
+                    <li><b>资金账号</b> -- 必填；zmq 的端口默认按账号自动推导</li>
+                    <li><b>账号类型 / 传输方式</b> -- 与服务端一致 (QMT 端 bigqmt 配置)</li>
+                    <li><b>host / port</b> -- zmq 连服务端；redis 连你的 Redis</li>
+                    <li><b>允许远程下单/撤单</b> -- 默认关闭。打开后任何能连上通道的程序都可下单，慎重</li>
+                    <li><b>QMT python 目录 / QMT 路径</b> -- 仅记录存档，本页暂不生成桥接文件</li>
+                </ul>
+
+                <p class="text-xs text-gray-500">
+                    当前生效的 <code>QMT_PATH</code> / <code>ACCOUNT_ID</code> 来自根目录
+                    <code>.env</code>（系统状态页同源），仅作展示，本页不改它。
+                </p>
+            </div>
+        </div>
+    </div>
+
+    <div class="grid-2">
+        <!-- 表单 -->
+        <div class="card">
+            <div class="card-header">
+                <div class="card-title">QMT 桥接配置</div>
+                <div class="card-subtitle">保存到 config/qmt_bridge.json</div>
+            </div>
+            <div class="space-y-3 p-4">
+                <div>
+                    <label class="block text-xs font-medium text-gray-600 mb-1">资金账号 *</label>
+                    <input class="w-full rounded border border-gray-300 px-3 py-2 text-sm"
+                           x-model.trim="form.account_id"
+                           placeholder="如 12345678" />
+                </div>
+
+                <div class="grid-2" style="gap:.75rem">
+                    <div>
+                        <label class="block text-xs font-medium text-gray-600 mb-1">账号类型</label>
+                        <select class="w-full rounded border border-gray-300 px-3 py-2 text-sm"
+                                x-model="form.account_type">
+                            <template x-for="t in accountTypes" :key="t">
+                                <option :value="t" x-text="t"></option>
+                            </template>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-medium text-gray-600 mb-1">传输方式</label>
+                        <select class="w-full rounded border border-gray-300 px-3 py-2 text-sm"
+                                x-model="form.transport">
+                            <template x-for="t in transports" :key="t">
+                                <option :value="t" x-text="t"></option>
+                            </template>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="grid-2" style="gap:.75rem">
+                    <div>
+                        <label class="block text-xs font-medium text-gray-600 mb-1"
+                               x-text="form.transport === 'zmq' ? '服务端地址 (host)' : 'Redis 地址 (host)'"></label>
+                        <input class="w-full rounded border border-gray-300 px-3 py-2 text-sm"
+                               x-model="form.host" placeholder="127.0.0.1" />
+                    </div>
+                    <div>
+                        <label class="block text-xs font-medium text-gray-600 mb-1">端口 (port)</label>
+                        <input class="w-full rounded border border-gray-300 px-3 py-2 text-sm"
+                               x-model="form.port" placeholder="留空按账号自动推导" />
+                    </div>
+                </div>
+
+                <div class="grid-2" style="gap:.75rem">
+                    <div>
+                        <label class="block text-xs font-medium text-gray-600 mb-1">Redis db</label>
+                        <input class="w-full rounded border border-gray-300 px-3 py-2 text-sm"
+                               x-model="form.db" placeholder="5" />
+                    </div>
+                    <div>
+                        <label class="block text-xs font-medium text-gray-600 mb-1">Redis 用户名 (可选)</label>
+                        <input class="w-full rounded border border-gray-300 px-3 py-2 text-sm"
+                               x-model="form.username" placeholder="无则留空" />
+                    </div>
+                </div>
+
+                <div>
+                    <label class="block text-xs font-medium text-gray-600 mb-1">Redis 密码 (可选)</label>
+                    <input type="password" class="w-full rounded border border-gray-300 px-3 py-2 text-sm"
+                           x-model="form.password" placeholder="无则留空" />
+                </div>
+
+                <div>
+                    <label class="block text-xs font-medium text-gray-600 mb-1">QMT python 目录 (存档)</label>
+                    <input class="w-full rounded border border-gray-300 px-3 py-2 text-sm font-mono"
+                           x-model="form.qmt_python_dir" placeholder="QMT 客户端 python 目录路径" />
+                </div>
+
+                <div>
+                    <label class="block text-xs font-medium text-gray-600 mb-1">QMT 安装路径 (存档)</label>
+                    <input class="w-full rounded border border-gray-300 px-3 py-2 text-sm font-mono"
+                           x-model="form.qmt_path" placeholder="如 C:\\QMT\\userdata_mini" />
+                </div>
+
+                <label class="flex items-center gap-2 text-sm text-gray-700 select-none">
+                    <input type="checkbox" class="rounded" x-model="form.allow_order_methods" />
+                    允许远程下单/撤单 (默认关闭)
+                </label>
+
+                <div class="flex gap-3 pt-2">
+                    <button class="btn btn-primary" @click="save()" :disabled="saving">
+                        <span x-show="!saving">保存配置</span>
+                        <span x-show="saving">保存中...</span>
+                    </button>
+                    <button class="btn" :class="pinging ? '' : 'btn-primary'"
+                            @click="ping()" :disabled="pinging">
+                        <span x-show="!pinging">测试连通</span>
+                        <span x-show="pinging">测试中...</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- 环境值 + 结果 -->
+        <div class="space-y-4">
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-title">当前生效 (来自 .env)</div>
+                    <div class="card-subtitle">系统状态页同源，本页只读</div>
+                </div>
+                <table class="app-table">
+                    <thead><tr><th>项</th><th>值</th></tr></thead>
+                    <tbody>
+                        <template x-if="env">
+                            <tr>
+                                <td class="text-xs text-gray-500">QMT_PATH</td>
+                                <td class="text-xs font-mono" x-text="env.qmt_path_env || '-'"></td>
+                            </tr>
+                            <tr>
+                                <td class="text-xs text-gray-500">ACCOUNT_ID</td>
+                                <td class="text-xs font-mono" x-text="env.account_id_env || '-'"></td>
+                            </tr>
+                        </template>
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-title">连通结果</div>
+                </div>
+                <div class="p-4 text-sm">
+                    <div x-show="!result" class="text-gray-400">点"测试连通"查看结果</div>
+                    <div x-show="result" x-cloak>
+                        <span class="badge"
+                              :class="result.ok ? 'badge-success' : 'badge-danger'"
+                              x-text="result.ok ? 'OK' : '失败'"></span>
+                        <div class="mt-2"
+                             :class="result.ok ? 'text-green-700' : 'text-red-700'"
+                             x-text="result.message"
+                             style="white-space:pre-line"></div>
+                        <div x-show="result.latency_ms !== undefined" class="mt-2 text-xs text-gray-500">
+                            延迟: <span x-text="result.latency_ms"></span> ms
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+</div>
+
+<script>
+function qmtApp() {
+    return {
+        showHelp: false,
+        accountTypes: ['STOCK', 'CREDIT', 'FUTURE', 'STOCK_OPTION'],
+        transports: ['zmq', 'redis'],
+        form: { account_id: '', account_type: 'STOCK', transport: 'zmq',
+                host: '127.0.0.1', port: '', db: '5', username: '',
+                password: '', qmt_python_dir: '', qmt_path: '',
+                allow_order_methods: false },
+        env: null,
+        result: null,
+        saving: false,
+        pinging: false,
+        async init() {
+            const data = await App.get('/api/qmt/config');
+            if (data && data.saved) this.form = Object.assign(this.form, data.saved);
+            if (data && data.env) this.env = data.env;
+        },
+        async save() {
+            this.saving = true;
+            const r = await App.post('/api/qmt/config', this.form);
+            this.saving = false;
+            App.toast(r.ok !== false ? '已保存' : (r.message || '保存失败'),
+                      r.ok !== false ? 'success' : 'danger');
+        },
+        async ping() {
+            this.pinging = true;
+            this.result = await App.post('/api/qmt/ping', {});
+            this.pinging = false;
+        },
+    }
+}
+</script>
+{% endblock %}

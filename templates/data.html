@@ -1,0 +1,135 @@
+{% extends "base.html" %}
+{% block title %}数据获取 -- AI 量化系统{% endblock %}
+
+{% block content %}
+<div x-data="dataApp()" x-init="init()">
+
+    <div class="mb-6">
+        <h1 class="text-2xl font-bold text-gray-900 mb-2">数据获取</h1>
+        <p class="text-sm text-gray-600">数据写入 / 实时行情 / 历史 K 线 / 晨会分析 / 策略数据 — 全链路脚本一览</p>
+    </div>
+
+    <!-- 脚本列表 -->
+    <div class="space-y-4">
+        <template x-for="group in scriptGroups" :key="group">
+            <div class="bg-white rounded-lg border border-gray-200 overflow-hidden">
+                <div class="bg-gray-50 px-4 py-3 border-b border-gray-200">
+                    <h3 class="text-sm font-semibold text-gray-700" x-text="group"></h3>
+                </div>
+                <div class="divide-y divide-gray-100">
+                    <template x-for="script in scripts.filter(s => s.group === group)" :key="script.name">
+                        <div class="p-4 hover:bg-gray-50 transition-colors">
+                            <div class="flex items-start justify-between mb-2">
+                                <div class="flex-1">
+                                    <div class="flex items-center gap-2 mb-1">
+                                        <span class="text-base font-semibold text-gray-900" x-text="script.label"></span>
+                                        <span class="text-xs text-gray-400 font-mono" x-text="script.name"></span>
+                                    </div>
+                                    <p class="text-sm text-gray-600 mb-2" x-text="script.description"></p>
+                                </div>
+                                <span class="badge"
+                                      :class="script.status === '已配置' || script.status === '内置' ? 'badge-success' : 'badge-warning'"
+                                      x-text="script.status"></span>
+                            </div>
+                            <div class="grid grid-cols-2 gap-3 text-xs">
+                                <div>
+                                    <span class="text-gray-500">调度:</span>
+                                    <span class="ml-1 text-gray-700" x-text="script.schedule"></span>
+                                </div>
+                                <div>
+                                    <span class="text-gray-500">I/O:</span>
+                                    <span class="ml-1 text-gray-700 font-mono" x-text="script.io || '-'"></span>
+                                </div>
+                                <div class="col-span-2">
+                                    <span class="text-gray-500">路径:</span>
+                                    <span class="ml-1 text-gray-700 font-mono break-all" x-text="script.path"></span>
+                                </div>
+                            </div>
+                            <!-- 运行进度条 -->
+                            <div x-show="script.progress" x-cloak class="mt-3">
+                                <div class="flex items-center justify-between text-xs mb-1">
+                                    <span class="font-medium text-gray-700">
+                                        <span x-text="script.progress.stage"></span>
+                                        <span class="ml-1"
+                                              :class="script.progress.status === 'done' ? 'text-green-600' : 'text-blue-600'"
+                                              x-text="script.progress.status === 'done' ? '已完成' : (script.progress.status === 'error' ? '失败' : '运行中')"></span>
+                                    </span>
+                                    <span class="text-gray-700 font-mono" x-text="script.progress.pct + '%'"></span>
+                                </div>
+                                <div class="w-full bg-gray-200 rounded-full h-2.5 overflow-hidden">
+                                    <div class="h-full rounded-full transition-all duration-500"
+                                          :class="script.progress.status === 'done' ? 'bg-green-500' : (script.progress.status === 'error' ? 'bg-red-500' : 'bg-blue-500')"
+                                          :style="'width:' + (script.progress.pct || 0) + '%'"></div>
+                                </div>
+                                <div class="text-xs text-gray-500 mt-1 truncate"
+                                     x-text="(script.progress.done || 0) + ' / ' + (script.progress.total || 0) + '  ' + (script.progress.message || '') + '  ·  ' + script.progress.updated_at"></div>
+                            </div>
+                        </div>
+                    </template>
+                </div>
+            </div>
+        </template>
+    </div>
+
+    <!-- 环境配置 -->
+    <div class="mt-8 bg-white rounded-lg border border-gray-200 overflow-hidden">
+        <div class="bg-gray-50 px-4 py-3 border-b border-gray-200">
+            <h3 class="text-sm font-semibold text-gray-700">环境配置状态</h3>
+        </div>
+        <div class="p-4">
+            <table class="w-full text-sm">
+                <thead>
+                    <tr class="text-left text-xs text-gray-500 border-b border-gray-200">
+                        <th class="pb-2">变量</th>
+                        <th class="pb-2">值</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-gray-100">
+                    <template x-for="(value, key) in env" :key="key">
+                        <tr>
+                            <td class="py-2 font-mono text-xs text-gray-700" x-text="key"></td>
+                            <td class="py-2 text-xs text-gray-600 break-all" x-text="value || '-'"></td>
+                        </tr>
+                    </template>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+</div>
+
+<script>
+function dataApp() {
+    return {
+        scripts: [],
+        env: {},
+        scriptGroups: [],
+        _timer: null,
+        async init() {
+            await this.load();
+            // 每 5 秒轮询, 刷新脚本运行进度 (不重建列表, 保持滚动位置)
+            this._timer = setInterval(() => this.load(true), 5000);
+        },
+        async load(progressOnly) {
+            const data = await App.get('/api/data/scripts');
+            if (!data) return;
+            if (progressOnly && this.scripts.length) {
+                // 仅同步进度字段: 按 name 匹配
+                const byName = {};
+                (data.scripts || []).forEach(s => byName[s.name] = s);
+                this.scripts.forEach(s => {
+                    const fresh = byName[s.name];
+                    s.progress = fresh ? fresh.progress : null;
+                });
+            } else {
+                this.scripts = data.scripts || [];
+                this.env = data.env || {};
+                const groups = new Set();
+                this.scripts.forEach(s => groups.add(s.group));
+                this.scriptGroups = Array.from(groups);
+            }
+        },
+    }
+}
+</script>
+{% endblock %}

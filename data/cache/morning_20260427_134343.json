@@ -1,0 +1,129 @@
+{
+  "saved_at": "2026-04-27T13:43:43",
+  "industry_rank": [
+    {
+      "industry": "玻璃玻纤",
+      "rank": 1,
+      "score": 7.788,
+      "raw_score": 7.788,
+      "MOM_21": 25.31,
+      "RS_60": 30.29,
+      "VOL_R": 1.07,
+      "phase": "neutral",
+      "phase_desc": "中性",
+      "ROC_20": 20.8,
+      "members": 15
+    },
+    {
+      "industry": "航海装备",
+      "rank": 2,
+      "score": 6.858,
+      "raw_score": 3.858,
+      "MOM_21": 13.71,
+      "RS_60": 9.48,
+      "VOL_R": 0.89,
+      "phase": "accel_up",
+      "phase_desc": "主升加速",
+      "ROC_20": 11.97,
+      "members": 10
+    },
+    {
+      "industry": "元件",
+      "rank": 3,
+      "score": 5.367,
+      "raw_score": 5.367,
+      "MOM_21": 17.72,
+      "RS_60": 11.7,
+      "VOL_R": 1.22,
+      "phase": "neutral",
+      "phase_desc": "中性",
+      "ROC_20": 15.26,
+      "members": 50
+    }
+  ],
+  "picked_stocks": [
+    {
+      "code": "000012.SZ",
+      "industry": "玻璃玻纤",
+      "alpha": 0.516,
+      "raw_factors": {
+        "MOM_1M": 0.007,
+        "MOM_3M": -0.002,
+        "VOL_20": -0.173,
+        "RSI_14": 2.83,
+        "BIAS_20": 0.002
+      }
+    },
+    {
+      "code": "002199.SZ",
+      "industry": "元件",
+      "alpha": 0.479,
+      "raw_factors": {
+        "MOM_1M": 0.276,
+        "MOM_3M": -0.047,
+        "VOL_20": -0.384,
+        "RSI_14": 26.636,
+        "BIAS_20": -0.067
+      }
+    },
+    {
+      "code": "601890.SH",
+      "industry": "航海装备",
+      "alpha": 0.446,
+      "raw_factors": {
+        "MOM_1M": 0.056,
+        "MOM_3M": -0.012,
+        "VOL_20": -0.258,
+        "RSI_14": 15.672,
+        "BIAS_20": -0.039
+      }
+    },
+    {
+      "code": "000636.SZ",
+      "industry": "元件",
+      "alpha": 0.372,
+      "raw_factors": {
+        "MOM_1M": 0.081,
+        "MOM_3M": 0.231,
+        "VOL_20": -0.451,
+        "RSI_14": 28.598,
+        "BIAS_20": -0.067
+      }
+    },
+    {
+      "code": "000823.SZ",
+      "industry": "元件",
+      "alpha": 0.35,
+      "raw_factors": {
+        "MOM_1M": 0.173,
+        "MOM_3M": 0.113,
+        "VOL_20": -0.496,
+        "RSI_14": 32.241,
+        "BIAS_20": -0.094
+      }
+    }
+  ],
+  "messages": [
+    {
+      "role": "industry",
+      "time": "13:43:41",
+      "content": "Top 3 板块: 玻璃玻纤, 航海装备, 元件"
+    },
+    {
+      "role": "stock_picker",
+      "time": "13:43:43",
+      "content": "选中 5 只: 000012.SZ, 002199.SZ, 601890.SH, 000636.SZ, 000823.SZ"
+    },
+    {
+      "role": "report",
+      "time": "13:43:43",
+      "content": "晨报生成 959 字节"
+    },
+    {
+      "role": "push",
+      "time": "13:43:43",
+      "content": "推送结果: {'console': True, 'dingtalk': False, 'wecom': False}"
+    }
+  ],
+  "report_html": "D:\\推荐系统\\量化交易-2\\25-其他\\CASE-AI量化系统\\morning_brief\\outputs\\reports\\morning_brief_20260427_134343.html"
+}

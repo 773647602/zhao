@@ -1,0 +1,592 @@
+{% extends "base.html" %}
+{% block title %}策略配置 -- AI 量化系统{% endblock %}
+
+{% block content %}
+<div x-data="strategyApp()" x-init="init()">
+
+    <!-- 使用说明 modal -->
+    <div class="modal-overlay" x-show="showHelp" x-cloak @click.self="showHelp = false">
+        <div class="modal-card">
+            <div class="modal-header">
+                <div class="modal-title">策略配置 -- 使用说明</div>
+                <button class="modal-close" @click="showHelp = false">×</button>
+            </div>
+            <div class="modal-body">
+                <h4>这个 Tab 是干嘛的</h4>
+                <p>集中查看系统所有已注册策略，按分组浏览，查看每个策略的详细说明、规则、适用场景。</p>
+
+                <h4>卡片说明</h4>
+                <ul>
+                    <li><b>绿点</b> = 该策略实例已启用（会参与选股）</li>
+                    <li><b>灰点</b> = 未启用（仅在策略库中）</li>
+                    <li><b>配置</b> 按钮: 调整该策略的参数 (均线周期 / 阈值等), 保存后即时生效</li>
+                    <li><b>启用 / 停用</b> 按钮: 开启或关闭该策略实例参与选股 (持久化到 strategy_selection.yaml)</li>
+                    <li><b>详情</b> 按钮: 弹窗查看策略的场景、规则、示例</li>
+                </ul>
+
+                <h4>分组</h4>
+                <ul>
+                    <li>技术指标 -- MACD / 均线 / RSI / BOLL / BIAS</li>
+                    <li>量化选股 -- 多因子合成</li>
+                    <li>龙头动量 -- 龙头首板战法</li>
+                    <li>趋势跟随 -- 海龟唐奇安通道</li>
+                    <li>震荡网格 -- 经典网格</li>
+                    <li>机器学习 -- ML 概率因子</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+
+    <!-- 策略详情 modal -->
+    <div class="modal-overlay" x-show="detail.show" x-cloak @click.self="detail.show = false">
+        <div class="modal-card" style="max-width:520px;">
+            <div class="modal-header">
+                <div class="modal-title" x-text="detail.label || '策略详情'"></div>
+                <button class="modal-close" @click="detail.show = false">×</button>
+            </div>
+            <div class="modal-body text-sm">
+                <div class="mb-3">
+                    <span class="badge badge-info" x-text="detail.group"></span>
+                    <span class="text-xs text-gray-400 ml-2 font-mono" x-text="detail.name"></span>
+                </div>
+                <p class="text-gray-700 mb-3 leading-relaxed" x-text="detail.description"></p>
+                <template x-if="detail.scenario">
+                    <div class="mb-3">
+                        <div class="text-xs font-medium text-gray-600 mb-1">适用场景</div>
+                        <p class="text-gray-600 text-xs leading-relaxed" x-text="detail.scenario"></p>
+                    </div>
+                </template>
+                <template x-if="detail.rules">
+                    <div class="mb-3">
+                        <div class="text-xs font-medium text-gray-600 mb-1">规则要点</div>
+                        <p class="text-gray-600 text-xs leading-relaxed" x-text="detail.rules"></p>
+                    </div>
+                </template>
+                <template x-if="detail.example">
+                    <div class="mb-3">
+                        <div class="text-xs font-medium text-gray-600 mb-1">示例</div>
+                        <p class="text-gray-600 text-xs leading-relaxed" x-text="detail.example"></p>
+                    </div>
+                </template>
+            </div>
+        </div>
+    </div>
+
+    <!-- 参数配置 modal -->
+    <div class="modal-overlay" x-show="cfg.show" x-cloak @click.self="cfg.show = false">
+        <div class="modal-card" :style="cfg.isFilter ? 'max-width:820px;' : 'max-width:560px;'">
+            <div class="modal-header">
+                <div class="modal-title">参数配置 -- <span x-text="cfg.label"></span></div>
+                <button class="modal-close" @click="cfg.show = false">×</button>
+            </div>
+            <div class="modal-body text-sm">
+                <div class="mb-3 text-xs text-gray-500">
+                    修改后点「保存」即时生效 (写入 config/strategy_params.json, 无需重启)。
+                    <span class="font-mono" x-text="cfg.name"></span>
+                </div>
+                <template x-if="cfg.isFilter">
+                    <div class="grid grid-cols-2 gap-3">
+                        <div>
+                            <label class="block text-xs text-gray-600 mb-1">昨日收盘涨幅 ＜ 阈值 %</label>
+                            <input type="number" step="0.1" class="w-full rounded border border-gray-300 px-2 py-1 text-sm font-mono"
+                                   placeholder="留空=禁用" x-model="cfg.values.max_prev_pct">
+                        </div>
+                        <div>
+                            <label class="block text-xs text-gray-600 mb-1">今日开盘涨幅 ＞ 阈值 %</label>
+                            <input type="number" step="0.1" class="w-full rounded border border-gray-300 px-2 py-1 text-sm font-mono"
+                                   placeholder="留空=禁用" x-model="cfg.values.min_open_pct">
+                        </div>
+                        <div>
+                            <label class="block text-xs text-gray-600 mb-1">昨日量能较前日增幅 % (≥)</label>
+                            <input type="number" step="10" class="w-full rounded border border-gray-300 px-2 py-1 text-sm font-mono"
+                                   placeholder="留空=禁用" x-model="cfg.values.min_vol_grow_pct">
+                        </div>
+                        <div>
+                            <label class="block text-xs text-gray-600 mb-1">昨日收盘站上 N 日线</label>
+                            <select class="w-full rounded border border-gray-300 px-2 py-1 text-sm font-mono" x-model="cfg.values.ma_period">
+                                <option :value="5">5日线</option>
+                                <option :value="10">10日线</option>
+                                <option :value="20">20日线</option>
+                                <option value="">禁用</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="block text-xs text-gray-600 mb-1">上证指数开盘涨幅 ＞ 阈值 % (高于则不选票)</label>
+                            <input type="number" step="0.1" class="w-full rounded border border-gray-300 px-2 py-1 text-sm font-mono"
+                                   placeholder="留空=禁用" x-model="cfg.values.max_index_pct">
+                        </div>
+                        <div class="flex items-center text-xs text-gray-400 col-span-2">留空表示该条件禁用<br>指数开盘涨幅高于阈值% 则整策略不选票</div>
+                    </div>
+                </template>
+                <!-- 买卖条件: 用 x-show 常驻 DOM (避免 <template x-if> 多根只渲染首元素的限制) -->
+                <div x-show="cfg.isFilter" class="mt-4 pt-3 border-t border-gray-200">
+                        <div class="flex items-center justify-between mb-2">
+                            <div class="text-sm font-semibold text-gray-700">买卖条件</div>
+                            <label class="flex items-center gap-1.5 text-xs text-gray-600 cursor-pointer">
+                                <input type="checkbox" class="w-4 h-4" x-model="cfg.values.trade_enabled">
+                                启用自动买卖（关闭 = 仅选股不交易）
+                            </label>
+                        </div>
+                        <div class="grid grid-cols-2 gap-3">
+                            <div>
+                                <label class="block text-xs text-gray-600 mb-1">买入：买入规则</label>
+                                <select class="w-full rounded border border-gray-300 px-2 py-1 text-sm"
+                                        x-model="cfg.values.buy_mode">
+                                    <option value="open">开盘买</option>
+                                    <option value="dip_recover">开盘下杀后上钩买</option>
+                                    <option value="hook">开盘下杀后回钩买(跟踪新低)</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label class="block text-xs text-gray-600 mb-1">买入：当日开盘涨幅 ≥ 阈值 %</label>
+                                <input type="number" step="0.1" class="w-full rounded border border-gray-300 px-2 py-1 text-sm font-mono"
+                                       placeholder="留空=不限" x-model="cfg.values.buy_open_pct_min">
+                            </div>
+                            <div>
+                                <label class="block text-xs text-gray-600 mb-1">买入：当日开盘涨幅 ≤ 阈值 %（高开上限）</label>
+                                <input type="number" step="0.1" class="w-full rounded border border-gray-300 px-2 py-1 text-sm font-mono"
+                                       placeholder="留空=不限" x-model="cfg.values.buy_open_pct_max">
+                            </div>
+                            <template x-if="cfg.values.buy_mode === 'dip_recover'">
+                                <div>
+                                    <label class="block text-xs text-gray-600 mb-1">下杀：开盘后最低较开盘价跌幅 ≥ %</label>
+                                    <input type="number" step="0.1" class="w-full rounded border border-gray-300 px-2 py-1 text-sm font-mono"
+                                           placeholder="如 2 表示跌2%后确认" x-model="cfg.values.buy_dip_pct">
+                                </div>
+                            </template>
+                            <template x-if="cfg.values.buy_mode === 'dip_recover'">
+                                <div>
+                                    <label class="block text-xs text-gray-600 mb-1">上钩：现价较开盘价回升 ≥ %</label>
+                                    <input type="number" step="0.1" class="w-full rounded border border-gray-300 px-2 py-1 text-sm font-mono"
+                                           placeholder="如 0.5 表示回升0.5%" x-model="cfg.values.buy_recover_pct">
+                                </div>
+                            </template>
+                            <template x-if="cfg.values.buy_mode === 'hook'">
+                                <div>
+                                    <label class="block text-xs text-gray-600 mb-1">下杀：现价较开盘价跌幅 ≥ %</label>
+                                    <input type="number" step="0.1" class="w-full rounded border border-gray-300 px-2 py-1 text-sm font-mono"
+                                           placeholder="如 2 表示跌2%后确认" x-model="cfg.values.buy_plunge_pct">
+                                </div>
+                            </template>
+                            <template x-if="cfg.values.buy_mode === 'hook'">
+                                <div>
+                                    <label class="block text-xs text-gray-600 mb-1">回钩：现价自盘中最低点回升 ≥ %</label>
+                                    <input type="number" step="0.1" class="w-full rounded border border-gray-300 px-2 py-1 text-sm font-mono"
+                                           placeholder="如 0.5 表示自最低回升0.5%" x-model="cfg.values.buy_rebound_pct">
+                                </div>
+                            </template>
+                            <div>
+                                <label class="block text-xs text-gray-600 mb-1">卖出：浮盈 ≥ 阈值 % 止盈</label>
+                                <input type="number" step="0.1" class="w-full rounded border border-gray-300 px-2 py-1 text-sm font-mono"
+                                       placeholder="留空=禁用" x-model="cfg.values.take_profit_pct">
+                            </div>
+                            <div>
+                                <label class="block text-xs text-gray-600 mb-1">卖出：浮亏 ≤ 阈值 % 止损（负值）</label>
+                                <input type="number" step="0.1" class="w-full rounded border border-gray-300 px-2 py-1 text-sm font-mono"
+                                       placeholder="如 -3 表示亏 3% 卖出" x-model="cfg.values.stop_loss_pct">
+                            </div>
+                        </div>
+                        <div class="text-xs text-gray-400 mt-2">
+                            止盈/止损以持仓成本价为基准（浮盈率 = 现价÷成本−1）；当日 09:26 选股入池后，09:29-09:35 开盘买入窗口内即评估买入。买入规则三选一：“开盘买”按开盘涨幅判断；“下杀后上钩买”以开盘价为基准（最低较开盘跌够阈值后，现价回升够阈值）；“下杀后回钩买(跟踪新低)”以盘中最低点为基准（现价跌破开盘价阈值确认下杀后，自盘中最低点回升够阈值即买）。
+                        </div>
+                    </div>
+                <template x-if="!cfg.isFilter">
+                <template x-if="cfg.params.length === 0">
+                    <div class="text-gray-400 text-sm py-6 text-center">该策略无可调参数</div>
+                </template>
+                <div class="space-y-3">
+                    <template x-for="p in cfg.params" :key="p.key">
+                        <div class="flex items-center justify-between gap-4">
+                            <div class="flex-1 min-w-0">
+                                <div class="text-sm text-gray-800">
+                                    <span x-text="p.label"></span>
+                                    <span class="text-xs text-gray-400 font-mono ml-1" x-text="'(' + p.key + ')'"></span>
+                                    <span class="badge badge-warning text-xs ml-1" x-show="p.modified">已改</span>
+                                </div>
+                                <div class="text-xs text-gray-400" x-show="p.desc" x-text="p.desc"></div>
+                                <div class="text-xs text-gray-400">缺省: <span class="font-mono" x-text="p.default"></span></div>
+                            </div>
+                            <div class="shrink-0">
+                                <template x-if="p.type === 'bool'">
+                                    <input type="checkbox" class="w-4 h-4" x-model="cfg.values[p.key]">
+                                </template>
+                                <template x-if="p.type !== 'bool'">
+                                    <input type="number"
+                                           class="rounded border border-gray-300 px-2 py-1 text-sm font-mono"
+                                           style="width:120px;"
+                                           :step="p.step || 1" :min="p.min" :max="p.max"
+                                           x-model.number="cfg.values[p.key]">
+                                </template>
+                            </div>
+                        </div>
+                    </template>
+                </div>
+                </template>
+                <div class="flex justify-end gap-2 mt-5">
+                    <button class="btn btn-secondary btn-sm" @click="resetCfg()">恢复缺省</button>
+                    <button class="btn btn-primary btn-sm" @click="saveConfig()" :disabled="cfg.saving">
+                        <span x-show="!cfg.saving">保存</span>
+                        <span x-show="cfg.saving">保存中...</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 顶部 Tab 栏 -->
+    <div class="flex items-center justify-between mb-3">
+        <div class="flex items-center gap-3">
+            <button class="px-4 py-1.5 rounded text-sm font-medium transition-colors"
+                    :class="tab === 'enabled' ? 'bg-indigo-600 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'"
+                    @click="tab = 'enabled'">
+                已启用 (<span x-text="enabledCount"></span>)
+            </button>
+            <button class="px-4 py-1.5 rounded text-sm font-medium transition-colors"
+                    :class="tab === 'library' ? 'bg-indigo-600 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'"
+                    @click="tab = 'library'">
+                策略库
+            </button>
+        </div>
+        <div class="flex items-center gap-3">
+            <label class="flex items-center gap-2 text-xs text-gray-500">
+                选取时间
+                <input type="datetime-local" x-model="runAt"
+                       class="border border-gray-300 rounded-md px-2 py-1 text-xs font-mono bg-white focus:outline-none focus:ring-2 focus:ring-indigo-500">
+            </label>
+            <button class="btn btn-primary btn-sm" @click="runSelection()" :disabled="running">
+                <span x-show="!running">立即选股</span>
+                <span x-show="running">选股中...</span>
+            </button>
+        </div>
+    </div>
+    <div class="text-xs text-gray-400 mb-4">
+        每个已启用策略按各自缺省执行时间自动选股 (可在 strategy_selection.yaml 配置)
+    </div>
+
+    <!-- 分组筛选 -->
+    <div class="flex flex-wrap items-center gap-2 mb-4">
+        <button class="px-3 py-1 rounded text-xs font-medium transition-colors"
+                :class="groupFilter === '' ? 'bg-indigo-600 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'"
+                @click="groupFilter = ''">全部</button>
+        <template x-for="g in allGroups" :key="g">
+            <button class="px-3 py-1 rounded text-xs font-medium transition-colors"
+                    :class="groupFilter === g ? 'bg-indigo-600 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'"
+                    @click="groupFilter = g"
+                    x-text="g"></button>
+        </template>
+    </div>
+
+    <!-- 策略卡片网格 -->
+    <template x-if="filtered.length === 0">
+        <div class="text-gray-400 text-sm py-12 text-center">暂无策略</div>
+    </template>
+
+    <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
+        <template x-for="s in filtered" :key="s.name">
+            <div class="bg-white rounded-lg border border-gray-200 p-4 relative shadow-sm hover:shadow-md transition-shadow">
+                <!-- 状态指示点 -->
+                <div class="absolute top-4 right-4">
+                    <span class="inline-block w-2.5 h-2.5 rounded-full"
+                          :class="s.enabled ? 'bg-green-500' : 'bg-gray-300'"
+                          :title="s.enabled ? '已启用' : '未启用'"></span>
+                </div>
+
+                <!-- 标题 -->
+                <div class="mb-3 pr-6">
+                    <div class="text-base font-semibold text-gray-900" x-text="s.label"></div>
+                    <div class="text-xs text-gray-400 font-mono mt-0.5" x-text="s.name"></div>
+                </div>
+
+                <!-- 描述 -->
+                <div class="text-xs text-gray-500 mb-3 leading-relaxed line-clamp-2" x-text="s.description"></div>
+
+                <!-- 分组标签 -->
+                <div class="mb-3 flex items-center gap-2 flex-wrap">
+                    <span class="badge badge-info text-xs" x-text="s.group"></span>
+                    <span class="text-xs text-gray-400 font-mono" x-show="s.last_run_at"
+                          :title="'最近执行: ' + s.last_run_at">
+                        执行: <span x-text="s.last_run_at.replace('T',' ').slice(5,16)"></span>
+                    </span>
+                </div>
+
+                <!-- 最近一次选股结果摘要 -->
+                <div class="text-xs mb-3" x-show="s.run_summary" x-cloak>
+                    <span class="text-gray-500">最近结果: </span>
+                    <span class="text-green-600" x-show="s.run_summary && s.run_summary.buy > 0"
+                          x-text="'买 ' + (s.run_summary ? s.run_summary.buy : 0)"></span>
+                    <span class="text-red-600" x-show="s.run_summary && s.run_summary.sell > 0"
+                          x-text="' 卖 ' + (s.run_summary ? s.run_summary.sell : 0)"></span>
+                    <span class="text-gray-400" x-text="' 观望 ' + (s.run_summary ? s.run_summary.hold : 0)"></span>
+                </div>
+
+                <!-- 操作按钮 -->
+                <div class="flex flex-wrap gap-2">
+                    <button class="btn btn-sm"
+                            :class="s.enabled ? 'btn-primary' : 'btn-secondary'"
+                            @click="toggleEnabled(s)">
+                        <span x-show="s.enabled">停用</span>
+                        <span x-show="!s.enabled">启用</span>
+                    </button>
+                    <button class="btn btn-primary btn-sm" @click="openConfig(s)">配置</button>
+                    <button class="btn btn-secondary btn-sm" @click="openDetail(s)">详情</button>
+                </div>
+
+                <!-- 默认执行时间 (仅启用策略显示, 只读展示, 页面不可更改) -->
+                <template x-if="s.enabled">
+                    <div class="mt-3 pt-3 border-t border-gray-100 text-sm">
+                        <span class="text-gray-500">默认执行时间：</span>
+                        <span class="font-mono font-medium text-indigo-600" x-text="_schDisplay(s.name)"></span>
+                        <span class="text-gray-400 text-xs ml-1">(页面不可改, 于 strategy_selection.yaml 配置)</span>
+                    </div>
+                </template>
+
+                <!-- 选股范围 (仅启用策略显示) -->
+                <template x-if="s.enabled">
+                    <div class="mt-3 pt-3 border-t border-gray-100">
+                        <div class="text-xs text-gray-500">
+                            选股范围:
+                            <template x-if="getBoundStocks(s.name).length > 0">
+                                <span class="font-mono text-xs" x-text="getBoundStocks(s.name).join(', ')"></span>
+                            </template>
+                            <template x-if="getBoundStocks(s.name).length === 0">
+                                <span class="text-gray-400" x-text="getScopeText(s.name)"></span>
+                            </template>
+                        </div>
+                    </div>
+                </template>
+            </div>
+        </template>
+    </div>
+
+</div>
+
+<script>
+function strategyApp() {
+    return {
+        showHelp: false,
+        tab: 'enabled',
+        groupFilter: '',
+        allGroups: [],
+        strategies: [],
+        config: { universe: { source: 'mysql' }, strategies: [] },
+        detail: { show: false, name: '', label: '', group: '', description: '', scenario: '', rules: '', example: '' },
+        cfg: { show: false, name: '', label: '', params: [], values: {}, saving: false },
+        selection: { last_run_at: '', last_trigger: '' },
+        running: false,
+        runAt: '',
+        get enabledCount() {
+            return this.strategies.filter(s => s.enabled).length;
+        },
+        get filtered() {
+            let list = this.strategies;
+            if (this.tab === 'enabled') {
+                list = list.filter(s => s.enabled);
+            }
+            if (this.groupFilter) {
+                list = list.filter(s => s.group === this.groupFilter);
+            }
+            return list;
+        },
+        async init() {
+            const data = await App.get('/api/strategy/list');
+            if (!data) return;
+            this.strategies = data.flat || [];
+            this.config = data.config || { universe: { source: 'mysql' }, strategies: [] };
+            this.selection = data.selection || { last_run_at: '', last_trigger: '' };
+            // 收集所有分组
+            const gset = new Set();
+            this.strategies.forEach(s => gset.add(s.group));
+            this.allGroups = Array.from(gset);
+        },
+        async runSelection() {
+            this.running = true;
+            // 若未填选取时间, 缺省为当前时刻
+            const sel = this.runAt || this._nowLocal();
+            const r = await App.post('/api/strategy/run', { selected_at: sel });
+            this.running = false;
+            if (r && r.ok) {
+                App.toast(r.message || '选股完成', 'success');
+            } else {
+                App.toast((r && r.message) || '选股失败', 'danger');
+            }
+            const data = await App.get('/api/strategy/list');
+            if (data) {
+                this.strategies = data.flat || [];
+                this.config = data.config || { universe: { source: 'mysql' }, strategies: [] };
+                this.selection = data.selection || { last_run_at: '', last_trigger: '' };
+            }
+        },
+        openDetail(s) {
+            this.detail = {
+                show: true, name: s.name, label: s.label, group: s.group,
+                description: s.description, scenario: s.scenario || '',
+                rules: s.rules || '', example: s.example || '',
+            };
+        },
+        openConfig(s) {
+            const isF = s.name === 'weak_to_strong';
+            let params = [], values = {}, initValues = {};
+            if (isF) {
+                const inst = this._instance(s.name);
+                const f = (inst && inst.selection && inst.selection.filters) || {};
+                values = this._weakEditable(f, inst ? inst.trade : null);
+                initValues = Object.assign({}, values);
+            } else {
+                params = s.params || [];
+                params.forEach(p => { values[p.key] = p.current; });
+                initValues = Object.assign({}, values);
+            }
+            this.cfg = { show: true, name: s.name, label: s.label, params, values, initValues, isFilter: isF, saving: false };
+        },
+        _weakEditable(f, t) {
+            const out = {};
+            ['max_prev_pct', 'min_open_pct', 'min_vol_grow_pct', 'max_index_pct'].forEach(k => {
+                out[k] = (f[k] !== null && f[k] !== undefined) ? f[k] : '';
+            });
+            out.ma_period = (f.ma_period !== null && f.ma_period !== undefined) ? f.ma_period : '';
+            t = t || {};
+            out.trade_enabled = !!t.enabled;
+            const b = t.buy || {};
+            out.buy_open_pct_min = (b.open_pct_min !== null && b.open_pct_min !== undefined) ? b.open_pct_min : '';
+            out.buy_open_pct_max = (b.open_pct_max !== null && b.open_pct_max !== undefined) ? b.open_pct_max : '';
+            out.buy_mode = (b.mode && b.mode !== 'open') ? b.mode : 'open';
+            out.buy_dip_pct = (b.dip_pct !== null && b.dip_pct !== undefined) ? b.dip_pct : 2.0;
+            out.buy_recover_pct = (b.recover_pct !== null && b.recover_pct !== undefined) ? b.recover_pct : 0.5;
+            out.buy_plunge_pct = (b.plunge_pct !== null && b.plunge_pct !== undefined) ? b.plunge_pct : 2.0;
+            out.buy_rebound_pct = (b.rebound_pct !== null && b.rebound_pct !== undefined) ? b.rebound_pct : 0.5;
+            const s = t.sell || {};
+            out.take_profit_pct = (s.take_profit_pct !== null && s.take_profit_pct !== undefined) ? s.take_profit_pct : '';
+            out.stop_loss_pct = (s.stop_loss_pct !== null && s.stop_loss_pct !== undefined) ? s.stop_loss_pct : '';
+            return out;
+        },
+        resetCfg() {
+            this.cfg.values = Object.assign({}, this.cfg.initValues);
+        },
+        async saveConfig() {
+            this.cfg.saving = true;
+            let r;
+            if (this.cfg.isFilter) {
+                const filters = {};
+                ['max_prev_pct', 'min_open_pct', 'min_vol_grow_pct', 'ma_period', 'max_index_pct'].forEach(k => {
+                    filters[k] = this._numOrNull(this.cfg.values[k]);
+                });
+                const trade = {
+                    enabled: !!this.cfg.values.trade_enabled,
+                    buy: {
+                        open_pct_min: this._numOrNull(this.cfg.values.buy_open_pct_min),
+                        open_pct_max: this._numOrNull(this.cfg.values.buy_open_pct_max),
+                        mode: this.cfg.values.buy_mode || 'open',
+                        dip_pct: this._numOrNull(this.cfg.values.buy_dip_pct),
+                        recover_pct: this._numOrNull(this.cfg.values.buy_recover_pct),
+                        plunge_pct: this._numOrNull(this.cfg.values.buy_plunge_pct),
+                        rebound_pct: this._numOrNull(this.cfg.values.buy_rebound_pct),
+                    },
+                    sell: {
+                        take_profit_pct: this._numOrNull(this.cfg.values.take_profit_pct),
+                        stop_loss_pct: this._numOrNull(this.cfg.values.stop_loss_pct),
+                    },
+                };
+                r = await App.post('/api/strategy/weaktest/config', { filters, trade });
+            } else {
+                r = await App.post('/api/strategy/params', {
+                    strategy: this.cfg.name, values: this.cfg.values,
+                });
+            }
+            this.cfg.saving = false;
+            if (r && r.ok) {
+                App.toast(this.cfg.isFilter ? '弱转强筛选与买卖条件已保存' : '参数已保存并生效', 'success');
+                const data = await App.get('/api/strategy/list');
+                if (data) {
+                    this.strategies = data.flat || [];
+                    this.config = data.config || { universe: { source: 'mysql' }, strategies: [] };
+                    if (this.cfg.isFilter) {
+                        const inst = this._instance(this.cfg.name);
+                        const f = (inst && inst.selection && inst.selection.filters) || {};
+                        this.cfg.values = this._weakEditable(f, inst ? inst.trade : null);
+                        this.cfg.initValues = Object.assign({}, this.cfg.values);
+                    }
+                }
+            } else {
+                App.toast((r && r.message) || '保存失败', 'danger');
+            }
+        },
+        _instance(name) {
+            return (this.config.strategies || []).find(i => i.name === name) || null;
+        },
+        getBoundStocks(name) {
+            const inst = this._instance(name);
+            if (!inst) return [];
+            if (inst.universe === 'code_list') return inst.code_list || [];
+            return ['全市场']; // all_a / 其他: 全市场按条件选股
+        },
+        getScopeText(name) {
+            const inst = this._instance(name);
+            if (!inst) { return '未配置实例'; }
+            if (!inst.selection || !inst.selection.mode) { return '未配置选股条件'; }
+            return inst.universe === 'code_list' ? '指定代码' : '全市场';
+        },
+        _schText(name) {
+            const inst = this._instance(name);
+            const sc = inst && inst.schedule;
+            return Array.isArray(sc) ? sc.join(',') : (sc || '');
+        },
+        _schDisplay(name) {
+            const t = (this._schText(name) || '09:27').trim();
+            return t + ':00';
+        },
+        async saveSchedule(name, value) {
+            try {
+                const r = await App.post('/api/strategy/schedule', { name, schedule: (value || '').trim() });
+                if (r && r.ok) {
+                    const inst = this._instance(name);
+                    if (inst) {
+                        const t = r.schedule || [];
+                        if (t.length) inst.schedule = t; else delete inst.schedule;
+                    }
+                    App.toast(r.message || '选股时间已保存', 'success');
+                } else {
+                    App.toast((r && (r.detail || r.message)) || '保存失败', 'danger');
+                }
+            } catch (e) {
+                App.toast('保存失败: ' + e, 'danger');
+            }
+        },
+        async toggleEnabled(s) {
+            const insts = this.config.strategies || [];
+            let inst = insts.find(i => i.name === s.name);
+            if (inst) {
+                inst.enabled = inst.enabled === false ? true : false;
+            } else {
+                insts.push({
+                    name: s.name, label: s.label, enabled: true,
+                    universe: 'all_a', lookback_days: 60, top_n: 20,
+                    selection: { mode: 'generic_filter', filters: {} },
+                });
+            }
+            const payload = { universe: this.config.universe || { source: 'mysql' }, strategies: insts };
+            const r = await App.post('/api/strategy/config', payload);
+            if (r && r.ok) {
+                App.toast('已更新「' + s.label + '」启用状态', 'success');
+                const data = await App.get('/api/strategy/list');
+                if (data) {
+                    this.strategies = data.flat || [];
+                    this.config = data.config || { universe: { source: 'mysql' }, strategies: [] };
+                }
+            } else {
+                App.toast(r && r.message || '保存失败', 'danger');
+            }
+        },
+        _numOrNull(v) {
+            if (v === '' || v === undefined || v === null) return null;
+            const n = Number(v);
+            return isNaN(n) ? null : n;
+        },
+        _nowLocal() {
+            const d = new Date();
+            const p = n => String(n).padStart(2, '0');
+            return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+        },
+    }
+}
+</script>
+{% endblock %}

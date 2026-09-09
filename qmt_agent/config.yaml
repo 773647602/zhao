@@ -1,0 +1,22 @@
+qmt_path: D:\国金证券QMT交易端\python
+account_id: '8890809055'
+transport: zmq
+log_level: INFO
+host: 本机-Windows
+platform: win
+stocks:
+- 600519.SH
+- 688981.SH
+- 300750.SZ
+- 513100.SH
+- 000001.SZ
+- 002241.SZ
+- 300059.SZ
+- 300014.SZ
+- 601991.SH
+servers:
+- name: 潇
+  server_url: ws://8.163.75.89
+  api_key: 7659c88de6420995a71fd45a6f6bbafcf14a141629a39683d304a57fbfe64acd
+  account_id: '8890809055'
+  enabled: true

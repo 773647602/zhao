@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}AI 量化交易系统{% endblock %}</title>
+
+    <!-- Tailwind CSS (CDN, 无构建) -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- 必须先于 Alpine: defer 脚本按顺序执行, main.js 定义 window.App, 页面里 x-init 会调 App.get -->
+    <link rel="stylesheet" href="/static/css/main.css">
+    <script defer src="/static/js/main.js"></script>
+    <!-- Alpine.js (轻量交互, 14kb) -->
+    <script defer src="https://unpkg.com/alpinejs@3.13.5/dist/cdn.min.js"></script>
+    <!-- Plotly.js (图表) -->
+    {% block plotly %}{% endblock %}
+    <style>[x-cloak] { display: none !important; }</style>
+    {% block head_extra %}{% endblock %}
+</head>
+<body>
+<nav class="app-nav">
+    <div class="brand">
+        AI 量化系统 <span class="accent">|</span> CEO 控制台
+    </div>
+    <div class="nav-tabs">
+        <a href="/live/sim" class="nav-tab {% if active=='live' %}active{% endif %}">实盘监控</a>
+        <a href="/backtest" class="nav-tab {% if active=='backtest' %}active{% endif %}">回测</a>
+        <a href="/review"   class="nav-tab {% if active=='review' %}active{% endif %}">复盘 & 策略管理</a>
+        <a href="/qmt"      class="nav-tab {% if active=='qmt' %}active{% endif %}">QMT 配置</a>
+        <a href="/data"     class="nav-tab {% if active=='data' %}active{% endif %}">数据获取</a>
+        <a href="/strategy" class="nav-tab {% if active=='strategy' %}active{% endif %}">策略配置</a>
+        <a href="/pool"     class="nav-tab {% if active=='pool' %}active{% endif %}">选股池</a>
+        <a href="/system"   class="nav-tab {% if active=='system' %}active{% endif %}">系统状态</a>
+    </div>
+</nav>
+
+<main class="app-main">
+    {% block content %}{% endblock %}
+</main>
+
+</body>
+</html>

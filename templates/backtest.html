@@ -1,0 +1,465 @@
+{% extends "base.html" %}
+{% block title %}回测 -- AI 量化系统{% endblock %}
+
+{% block plotly %}
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+{% endblock %}
+
+{% block content %}
+<div x-data="backtestApp()" x-init="init()">
+
+    <!-- 使用说明 modal -->
+    <div class="modal-overlay" x-show="showHelp" x-cloak @click.self="showHelp = false">
+        <div class="modal-card" style="max-width:680px;">
+            <div class="modal-header">
+                <div class="modal-title">回测 -- 使用说明</div>
+                <button class="modal-close" @click="showHelp = false">×</button>
+            </div>
+            <div class="modal-body">
+                <h4>快速回测 ⚡（基于选股池）</h4>
+                <p>选择「选股策略」后，读取该策略在选股池中选出的全部股票逐只回测。可选「选股时间」：选某交易日则只用该日选出的股票；不选则用该策略选股池中的全部股票。</p>
+                <h4>标准回测 📊（基于日线数据）</h4>
+                <p>直接基于日线数据完整回测：可填股票代码（逗号分隔），留空则取全市场有日线数据的前 300 只。</p>
+                <h4>输出口径</h4>
+                <ul>
+                    <li><b>单只盈亏</b>: 每只股票独立回测（默认每只初始资金 100 万），单只盈亏 = 最终市值 − 初始资金</li>
+                    <li><b>整体盈亏</b>: 所有单只盈亏直接相加（正盈利 + 负盈利）</li>
+                    <li><b>行情</b>: 日 K 来自 MySQL <code>trade_stock_daily</code>，回测要求区间内 ≥30 根 K 线</li>
+                </ul>
+                <h4>撮合</h4>
+                <p>信号在 K 线收盘出 -&gt; 用下一根 K 线开盘价成交（避免未来函数），A 股 T+1，单只 95% 资金满仓，单边手续费万 2。</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- 页面标题 -->
+    <div class="flex items-center justify-between mb-6">
+        <div>
+            <h1 class="text-2xl font-bold text-gray-900 mb-1">回测</h1>
+            <p class="text-sm text-gray-600">选择回测模式，按策略对一组股票逐一回测：输出每只盈亏与整体盈亏（异步执行，页面实时轮询进度）</p>
+        </div>
+        <button class="help-btn" @click="showHelp = true" title="使用说明">?</button>
+    </div>
+
+    <div class="flex-col">
+
+        <!-- ==================== 模式选择 ==================== -->
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <!-- 快速回测 -->
+            <label :class="batch.mode === 'fast'
+                          ? 'border-indigo-500 bg-indigo-50/60 shadow-md ring-2 ring-indigo-200'
+                          : 'border-gray-200 bg-white hover:border-gray-300 hover:shadow-sm'"
+                   class="rounded-xl border-2 p-5 cursor-pointer transition-all flex items-start gap-4">
+                <input type="radio" value="fast" x-model="batch.mode" class="sr-only">
+                <div class="w-11 h-11 rounded-xl flex items-center justify-center text-2xl shrink-0"
+                     :class="batch.mode === 'fast' ? 'bg-indigo-100 text-indigo-600' : 'bg-gray-100 text-gray-400'">⚡</div>
+                <div class="flex-1">
+                    <div class="flex items-center gap-2">
+                        <span class="font-bold text-gray-900 text-sm">快速回测</span>
+                        <span class="badge badge-info text-[10px]" x-show="batch.mode === 'fast'">当前模式</span>
+                    </div>
+                    <div class="text-xs text-gray-500 mt-1 leading-relaxed">
+                        基于选股池：读取该策略选出的全部股票逐只回测，可按选股时间筛选当日入选股票
+                    </div>
+                    <div class="text-[11px] text-gray-400 mt-1" x-show="batch.mode === 'fast'"
+                         x-text="'当前策略 ' + (batch.selectionStrategy || '-') + ' · 池内 ' + poolTotal() + ' 只'"></div>
+                </div>
+            </label>
+
+            <!-- 标准回测 -->
+            <label :class="batch.mode === 'standard'
+                          ? 'border-indigo-500 bg-indigo-50/60 shadow-md ring-2 ring-indigo-200'
+                          : 'border-gray-200 bg-white hover:border-gray-300 hover:shadow-sm'"
+                   class="rounded-xl border-2 p-5 cursor-pointer transition-all flex items-start gap-4">
+                <input type="radio" value="standard" x-model="batch.mode" class="sr-only">
+                <div class="w-11 h-11 rounded-xl flex items-center justify-center text-2xl shrink-0"
+                     :class="batch.mode === 'standard' ? 'bg-indigo-100 text-indigo-600' : 'bg-gray-100 text-gray-400'">📊</div>
+                <div class="flex-1">
+                    <div class="flex items-center gap-2">
+                        <span class="font-bold text-gray-900 text-sm">标准回测</span>
+                        <span class="badge badge-info text-[10px]" x-show="batch.mode === 'standard'">当前模式</span>
+                    </div>
+                    <div class="text-xs text-gray-500 mt-1 leading-relaxed">
+                        基于日线数据完整回测：可指定股票代码，留空则回测全市场有日线数据的前 300 只
+                    </div>
+                </div>
+            </label>
+        </div>
+
+        <!-- ==================== 回测配置 ==================== -->
+        <div class="card">
+            <div class="card-header">
+                <div>
+                    <div class="card-title" x-text="batch.mode === 'fast' ? '快速回测配置' : '标准回测配置'"></div>
+                    <div class="text-xs text-gray-500 font-normal mt-0.5"
+                         x-text="batch.mode === 'fast'
+                                 ? '股票范围来自选股池（按选股策略 + 可选选股时间），用右侧交易策略逐只回测'
+                                 : '股票范围来自日线数据库（可指定代码 / 留空全市场前300只），用交易策略逐只完整回测'"></div>
+                </div>
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-12 gap-3 items-end">
+
+                <!-- ===== 快速回测字段 ===== -->
+                <template x-if="batch.mode === 'fast'">
+                    <div class="md:col-span-12 grid grid-cols-1 md:grid-cols-12 gap-3 items-end">
+                        <div class="md:col-span-3">
+                            <label class="block text-xs text-gray-600 mb-1">选股策略</label>
+                            <select class="form-select w-full" x-model="batch.selectionStrategy" @change="onSelStrategyChange()">
+                                <option value="" disabled>请选择选股策略</option>
+                                <template x-for="s in poolMeta.strategies" :key="s">
+                                    <option :value="s" x-text="s"></option>
+                                </template>
+                            </select>
+                        </div>
+                        <div class="md:col-span-3">
+                            <label class="block text-xs text-gray-600 mb-1">选股时间</label>
+                            <select class="form-select w-full" x-model="batch.tradeDate">
+                                <option value="" x-text="'全部交易日（共 ' + poolTotal() + ' 只）'"></option>
+                                <template x-for="d in poolDates()" :key="d.trade_date">
+                                    <option :value="d.trade_date" x-text="d.trade_date + '（' + d.count + ' 只）'"></option>
+                                </template>
+                            </select>
+                        </div>
+                        <div class="md:col-span-3">
+                            <label class="block text-xs text-gray-600 mb-1">交易策略</label>
+                            <select class="form-select w-full" x-model="batch.strategy">
+                                <template x-for="s in strategies" :key="s.name">
+                                    <option :value="s.name" x-text="s.label"></option>
+                                </template>
+                            </select>
+                        </div>
+                        <div class="md:col-span-3 flex gap-2">
+                            <div class="flex-1">
+                                <label class="block text-xs text-gray-600 mb-1">起始日期</label>
+                                <input type="date" class="form-input w-full" x-model="batch.start">
+                            </div>
+                            <div class="flex-1">
+                                <label class="block text-xs text-gray-600 mb-1">结束日期</label>
+                                <input type="date" class="form-input w-full" x-model="batch.end">
+                            </div>
+                        </div>
+                        <div class="md:col-span-12 flex justify-end">
+                            <button class="btn btn-primary btn-lg" @click="startBatch()" :disabled="batch.running || !batch.selectionStrategy">
+                                <span x-show="!batch.running">⚡ 开始快速回测</span>
+                                <span x-show="batch.running">运行中...</span>
+                            </button>
+                        </div>
+                    </div>
+                </template>
+
+                <!-- ===== 标准回测字段 ===== -->
+                <template x-if="batch.mode === 'standard'">
+                    <div class="md:col-span-12 grid grid-cols-1 md:grid-cols-12 gap-3 items-end">
+                        <div class="md:col-span-4">
+                            <label class="block text-xs text-gray-600 mb-1">股票代码（逗号分隔，留空 = 全市场前 300 只）</label>
+                            <input type="text" class="form-input w-full" x-model="batch.codes"
+                                   placeholder="600519.SH,000001.SZ" @keyup.enter="startBatch()">
+                        </div>
+                        <div class="md:col-span-3">
+                            <label class="block text-xs text-gray-600 mb-1">交易策略</label>
+                            <select class="form-select w-full" x-model="batch.strategy">
+                                <template x-for="s in strategies" :key="s.name">
+                                    <option :value="s.name" x-text="s.label"></option>
+                                </template>
+                            </select>
+                        </div>
+                        <div class="md:col-span-3 flex gap-2">
+                            <div class="flex-1">
+                                <label class="block text-xs text-gray-600 mb-1">起始日期</label>
+                                <input type="date" class="form-input w-full" x-model="batch.start">
+                            </div>
+                            <div class="flex-1">
+                                <label class="block text-xs text-gray-600 mb-1">结束日期</label>
+                                <input type="date" class="form-input w-full" x-model="batch.end">
+                            </div>
+                        </div>
+                        <div class="md:col-span-2 flex justify-end">
+                            <button class="btn btn-primary btn-lg w-full" @click="startBatch()" :disabled="batch.running">
+                                <span x-show="!batch.running">📊 开始标准回测</span>
+                                <span x-show="batch.running">运行中...</span>
+                            </button>
+                        </div>
+                    </div>
+                </template>
+
+            </div>
+
+            <!-- 进度条 -->
+            <div x-show="batch.running" class="mt-4">
+                <div class="flex justify-between text-xs text-gray-500 mb-1">
+                    <span>
+                        正在回测 <span class="font-mono" x-text="(batch.progressDone || 0)"></span> /
+                        <span class="font-mono" x-text="(batch.progressTotal || 0)"></span> 只
+                        <span class="text-gray-400" x-show="batch.result?.failed?.length">（失败 <span x-text="batch.result.failed.length"></span> 只）</span> ...
+                    </span>
+                    <span class="font-mono" x-text="batch.progressPct ? batch.progressPct + '%' : ''"></span>
+                </div>
+                <div class="h-2.5 bg-gray-100 rounded-full overflow-hidden">
+                    <div class="h-full bg-gradient-to-r from-indigo-500 to-blue-500 rounded-full transition-all duration-500"
+                         :style="'width:' + (batch.progressPct || 0) + '%'"></div>
+                </div>
+            </div>
+
+            <!-- 错误提示 -->
+            <div x-show="errMsg" class="mt-3 text-sm text-red-600 bg-red-50 border border-red-100 rounded-md px-3 py-2">
+                <span x-text="errMsg"></span>
+            </div>
+        </div>
+
+        <!-- ==================== 回测结果 ==================== -->
+        <div class="card" x-show="batch.result" x-cloak>
+            <div class="card-header">
+                <div>
+                    <div class="card-title" x-text="(batch.mode === 'fast' ? '快速回测' : '标准回测') + '结果'"></div>
+                    <div class="text-xs text-gray-500 font-normal mt-0.5">
+                        共 <span class="font-semibold" x-text="(batch.result?.summary?.stock_count || 0)"></span> 只成功 ·
+                        失败 <span class="font-semibold" x-text="(batch.result?.failed || []).length"></span> 只 ·
+                        区间 <span class="font-mono" x-text="batch.start"></span> ~ <span class="font-mono" x-text="batch.end"></span> ·
+                        策略 <span x-text="batch.strategy"></span>
+                        <template x-if="batch.mode === 'fast'">
+                            · 选股策略 <span x-text="batch.selectionStrategy"></span>
+                            <template x-if="batch.tradeDate"> · 选股时间 <span class="font-mono" x-text="batch.tradeDate"></span></template>
+                        </template>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 整体盈亏统计 -->
+            <div class="grid grid-cols-2 md:grid-cols-5 gap-3 text-sm mb-4" x-show="batch.result?.summary">
+                <div class="rounded-xl border border-gray-100 bg-gray-50/60 p-4">
+                    <div class="text-xs text-gray-500">整体盈亏（正+负）</div>
+                    <div class="text-2xl num font-bold mt-1"
+                         :class="batch.result.summary.total_pnl > 0 ? 'pos' : (batch.result.summary.total_pnl < 0 ? 'neg' : 'text-gray-500')"
+                         x-text="App.fmtSign(batch.result.summary.total_pnl, 0)"></div>
+                    <div class="text-xs text-gray-400 mt-1">
+                        盈利 <span class="pos font-semibold" x-text="batch.result.summary.win_count"></span> 只 /
+                        亏损 <span class="neg font-semibold" x-text="batch.result.summary.loss_count"></span> 只 /
+                        持平 <span x-text="batch.result.summary.flat_count"></span> 只
+                    </div>
+                </div>
+                <div class="rounded-xl border border-gray-100 p-4">
+                    <div class="text-xs text-gray-500">正盈利合计</div>
+                    <div class="text-xl num pos mt-1" x-text="App.fmtSign(batch.result.summary.positive_pnl, 0)"></div>
+                    <div class="text-xs text-gray-400 mt-1">所有盈利股票的盈亏相加</div>
+                </div>
+                <div class="rounded-xl border border-gray-100 p-4">
+                    <div class="text-xs text-gray-500">负盈利合计</div>
+                    <div class="text-xl num neg mt-1" x-text="App.fmtSign(batch.result.summary.negative_pnl, 0)"></div>
+                    <div class="text-xs text-gray-400 mt-1">所有亏损股票的盈亏相加</div>
+                </div>
+                <div class="rounded-xl border border-gray-100 p-4">
+                    <div class="text-xs text-gray-500">平均收益率</div>
+                    <div class="text-xl num mt-1"
+                         :class="batch.result.summary.avg_total_return > 0 ? 'pos' : (batch.result.summary.avg_total_return < 0 ? 'neg' : '')"
+                         x-text="App.fmtPct(batch.result.summary.avg_total_return)"></div>
+                    <div class="text-xs text-gray-400 mt-1">单只收益率的简单平均</div>
+                </div>
+                <div class="rounded-xl border border-gray-100 p-4">
+                    <div class="text-xs text-gray-500">说明</div>
+                    <div class="text-xs text-gray-500 leading-relaxed mt-1">每只股票独立回测（默认每只初始资金 100 万），单只盈亏 = 最终市值 − 初始资金；整体盈亏 = 各单只盈亏相加</div>
+                </div>
+            </div>
+
+            <!-- 失败列表 -->
+            <div x-show="(batch.result?.failed || []).length > 0"
+                 class="text-xs text-amber-700 bg-amber-50 border border-amber-100 rounded-md px-3 py-2 mb-3 leading-relaxed">
+                失败（常见：区间内数据不足 / 无日线）:
+                <template x-for="(f, i) in (batch.result?.failed || [])" :key="i">
+                    <span class="ml-1" x-text="f.code + '（' + f.error + '）'"></span>
+                </template>
+            </div>
+
+            <!-- 单只盈亏表 -->
+            <div class="overflow-x-auto rounded-lg border border-gray-100">
+                <table class="app-table">
+                    <thead><tr>
+                        <th>股票</th>
+                        <th class="text-right">单只盈亏</th>
+                        <th class="text-right">收益率</th>
+                        <th class="text-right">年化</th>
+                        <th class="text-right">最大回撤</th>
+                        <th class="text-right">夏普</th>
+                        <th class="text-right">胜率</th>
+                        <th class="text-right">交易</th>
+                    </tr></thead>
+                    <tbody>
+                        <template x-for="r in (batch.result?.rows || [])" :key="r.stock_code">
+                            <tr>
+                                <td>
+                                    <span class="text-sm" x-text="r.stock_code"></span>
+                                    <span class="text-xs text-gray-400 ml-1" x-text="r.name || ''"></span>
+                                </td>
+                                <td class="text-right num font-semibold"
+                                    :class="r.pnl > 0 ? 'pos' : (r.pnl < 0 ? 'neg' : '')"
+                                    x-text="App.fmtSign(r.pnl, 0)"></td>
+                                <td class="text-right num" :class="metricCls(r.total_return)"
+                                    x-text="App.fmtPct(r.total_return)"></td>
+                                <td class="text-right num" :class="metricCls(r.annual_return)"
+                                    x-text="App.fmtPct(r.annual_return)"></td>
+                                <td class="text-right num neg" x-text="'-' + App.fmtPct(r.max_drawdown)"></td>
+                                <td class="text-right num" x-text="App.fmtNum(r.sharpe, 2)"></td>
+                                <td class="text-right num" x-text="App.fmtPct(r.win_rate)"></td>
+                                <td class="text-right num" x-text="r.trades"></td>
+                            </tr>
+                        </template>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+    </div>
+</div>
+
+<script>
+function backtestApp() {
+    // 默认日期: 最近 1 年
+    const today = new Date();
+    const oneYearAgo = new Date();
+    oneYearAgo.setFullYear(today.getFullYear() - 1);
+    const fmt = (d) => d.toISOString().slice(0, 10);
+
+    return {
+        showHelp: false,
+        ping: null,
+        strategies: [],
+        poolMeta: { strategies: [], dates: {} },
+        batch: {
+            mode: 'fast',              // fast=快速回测(选股池) / standard=标准回测(日线)
+            selectionStrategy: '',     // 选股策略 (快速回测)
+            tradeDate: '',             // 选股时间 (空=全部交易日)
+            codes: '',                 // 股票代码 (标准回测)
+            strategy: 'macd_1d',       // 交易策略
+            start: fmt(oneYearAgo),
+            end:   fmt(today),
+            running: false,
+            result: null,
+            progressDone: 0,
+            progressTotal: 0,
+            progressPct: 0,
+        },
+        _batchTimer: null,
+        errMsg: '',
+        metricCls(v) {
+            if (v === null || v === undefined || isNaN(v)) return '';
+            return Number(v) > 0 ? 'pos' : (Number(v) < 0 ? 'neg' : '');
+        },
+
+        async init() {
+            // 拉策略列表 + ping 数据源
+            try {
+                const sres = await App.get('/api/backtest/strategies');
+                this.strategies = (sres && sres.list) ? sres.list : [];
+                if (this.strategies.length > 0
+                        && !this.strategies.find(s => s.name === this.batch.strategy)) {
+                    this.batch.strategy = this.strategies[0].name;
+                }
+            } catch (e) { console.error('strategies', e); }
+            try { this.ping = await App.get('/api/backtest/ping'); } catch (e) { console.error('ping', e); }
+            // 选股池元数据 (快速回测下拉)
+            try {
+                const pm = await App.get('/api/backtest/pool-meta');
+                if (pm && pm.ok) {
+                    this.poolMeta = { strategies: pm.strategies || [], dates: pm.dates || {} };
+                    if (this.poolMeta.strategies.length > 0) {
+                        this.batch.selectionStrategy = this.poolMeta.strategies[0];
+                    }
+                }
+            } catch (e) { console.error('pool-meta', e); }
+        },
+
+        // ---------- 快速回测 (选股池) ----------
+        onSelStrategyChange() {
+            // 切换选股策略时, 选股时间回到"全部交易日"
+            this.batch.tradeDate = '';
+        },
+        poolDates() {
+            return (this.poolMeta.dates || {})[this.batch.selectionStrategy] || [];
+        },
+        poolTotal() {
+            return this.poolDates().reduce((s, d) => s + (d.count || 0), 0);
+        },
+
+        // ---------- 启动/轮询 ----------
+        _batchProgress() {
+            const p = this.batch.result && this.batch.result.progress;
+            if (!p) return { done: 0, total: 0, pct: 0 };
+            const done = p.done || 0, total = p.total || 0;
+            return { done, total, pct: total > 0 ? Math.round(done * 100 / total) : 0 };
+        },
+        async startBatch() {
+            if (this.batch.running) return;
+            this.errMsg = '';
+            const apiMode = this.batch.mode === 'fast' ? 'pool' : 'daily';
+            const payload = {
+                mode: apiMode,
+                strategy: this.batch.strategy,
+                start: this.batch.start,
+                end:   this.batch.end,
+            };
+            if (apiMode === 'pool') {
+                if (!this.batch.selectionStrategy) {
+                    this.errMsg = '请先选择选股策略';
+                    return;
+                }
+                payload.selection_strategy = this.batch.selectionStrategy;
+                payload.trade_date = this.batch.tradeDate;
+            } else {
+                payload.codes = (this.batch.codes || '').trim();
+            }
+            this.batch.running = true;
+            this.batch.result = null;
+            try {
+                const r = await App.post('/api/backtest/batch', payload);
+                if (r && r.ok) {
+                    App.toast(r.message || '回测已启动', 'success');
+                    this._pollBatch(r.task_id);
+                } else {
+                    this.batch.running = false;
+                    this.errMsg = (r && r.message) || '启动失败';
+                }
+            } catch (e) {
+                this.batch.running = false;
+                this.errMsg = String(e);
+            }
+        },
+        async _pollBatch(taskId) {
+            if (this._batchTimer) clearInterval(this._batchTimer);
+            const tick = async () => {
+                try {
+                    const r = await App.get('/api/backtest/batch/' + taskId);
+                    if (!r || !r.ok) {
+                        this.batch.running = false;
+                        if (this._batchTimer) { clearInterval(this._batchTimer); this._batchTimer = null; }
+                        return;
+                    }
+                    this.batch.result = r;
+                    const p = this._batchProgress();
+                    this.batch.progressDone = p.done;
+                    this.batch.progressTotal = p.total;
+                    this.batch.progressPct = p.pct;
+                    if (r.status === 'done') {
+                        this.batch.running = false;
+                        if (this._batchTimer) { clearInterval(this._batchTimer); this._batchTimer = null; }
+                        App.toast('回测完成: ' + ((r.summary && r.summary.stock_count) || 0) + ' 只成功', 'success');
+                    } else if (r.status === 'error' || r.status === 'cancelled') {
+                        this.batch.running = false;
+                        if (this._batchTimer) { clearInterval(this._batchTimer); this._batchTimer = null; }
+                        this.errMsg = r.error || '回测已中断';
+                    }
+                } catch (e) {
+                    // 单次轮询失败不中断, 继续下一轮
+                    console.error('poll batch', e);
+                }
+            };
+            await tick();
+            if (this.batch.running && !this._batchTimer) {
+                this._batchTimer = setInterval(tick, 2000);
+            }
+        },
+
+    };
+}
+</script>
+
+{% endblock %}

@@ -1,0 +1,36 @@
+# 多策略并行选股配置 (strategy -> stock-list 模型, 无默认策略)
+# 每个条目是一个可独立开关的策略实例, 各自配置在全市场(A股, 有日K)上按自己的选股条件选股。
+# 选股池只记录候选; 买入/卖出由各策略在各自候选+持仓上独立判断, 共享资金/独立持仓。
+# 修改后调用 POST /api/strategy/run 或等待定时选股即可生效。
+
+universe:
+  source: mysql
+strategies:
+- name: weak_to_strong
+  label: 弱转强
+  enabled: true
+  schedule: 09:26
+  top_n: 10
+  selection:
+    mode: generic_filter
+    sort_by: amount
+    sort_desc: true
+    filters:
+      max_prev_pct: 0
+      min_open_pct: 3
+      min_vol_grow_pct: 4
+      ma_period: 10
+      max_index_pct: null
+  trade:
+    enabled: true
+    buy:
+      mode: hook
+      open_pct_min: null
+      dip_pct: 3
+      recover_pct: 0.2
+      plunge_pct: 2
+      rebound_pct: 1
+      open_pct_max: 6
+    sell:
+      take_profit_pct: 110
+      stop_loss_pct: -100

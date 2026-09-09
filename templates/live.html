@@ -1,0 +1,1631 @@
+{% extends "base.html" %}
+{% block title %}实盘监控 -- AI 量化系统{% endblock %}
+
+{% block content %}
+<div x-data="liveApp()" x-init="init()">
+
+    <!-- 使用说明 modal -->
+    <div class="modal-overlay" x-show="showHelp" x-cloak @click.self="showHelp = false">
+        <div class="modal-card">
+            <div class="modal-header">
+                <div class="modal-title">实盘监控 -- 使用说明</div>
+                <button class="modal-close" @click="showHelp = false">×</button>
+            </div>
+            <div class="modal-body text-sm">
+                <p class="text-gray-700 leading-relaxed mb-3">
+                    本页负责<strong>自动跑策略循环</strong> (约每分钟一轮): 拉行情 → 算信号 → 风控 → 下单。
+                    默认<strong>模拟</strong>, 不会连券商; 选实盘前务必确认 miniQMT 与账户。
+                </p>
+
+                <h4 class="text-gray-900 font-medium mt-2 mb-1">怎么用 (三步)</h4>
+                <ol class="list-decimal pl-5 space-y-1.5 text-gray-700">
+                    <li>左侧「实时持仓」只展示<b>实际买入成交</b>的持仓; 监控列表见下方「监控池」。</li>
+                    <li>监控池 = 今日各策略选出的候选股; 满足策略买入规则时由主循环自动下单。</li>
+                    <li>右侧「资金面板」头部即是引擎开关 -- <strong>启动 / 停止</strong>; 持仓 / 买入 / 监控约 <strong>5 秒</strong>自动刷新。</li>
+                </ol>
+
+                <h4 class="text-gray-900 font-medium mt-4 mb-1">监控列表从哪来</h4>
+                <p class="text-gray-600 text-xs leading-relaxed">
+                    合并去重: 当日选股池 + watch_pool 列表 + 已绑定策略 (per_stock) 的代码; 「添加股票」会同时写 watch_pool 和 per_stock。
+                    A 股 <strong>T+1</strong>: 当日买的次日才能卖; 日 K 类策略往往比 5 分钟更贴合隔日节奏。
+                </p>
+
+                <h4 class="text-gray-900 font-medium mt-4 mb-1">引擎控制 / 风控 / 应急</h4>
+                <p class="text-gray-600 text-xs leading-relaxed">
+                    右侧「资金面板」头部带<strong>启动 / 停止</strong>按钮和状态徽章 (RUNNING / PAUSED / HALTED);
+                    下方有<strong>重置持仓 / 清空历史</strong>两条工具链接。
+                    更下方「风控」卡片是固定说明 (单笔 ≤10% 资金、亏 ≥2% 自动熔断);
+                    最底部「应急干预」(暂停买入 / 一键清仓 / 强制熔断) 平时折叠, 黑天鹅时才打开。
+                </p>
+
+                <h4 class="text-gray-900 font-medium mt-4 mb-1">进阶扩展</h4>
+                <ul class="list-disc pl-5 text-gray-600 text-xs space-y-1">
+                    <li><strong>兜底策略</strong>: 未在 per_stock 里指定的代码会走 <code>config/strategies.yaml</code> 的 <code>default</code>。</li>
+                    <li><strong>批量编辑 / 临时代码</strong>: 直接改 <code>config/watch_pool.yaml</code>、<code>config/strategies.yaml</code>; 修改后调 <code>POST /api/live/strategies/config</code> 触发热加载。</li>
+                    <li><strong>事件流</strong>: 每轮循环的耗时与信号数, 可在 <code>GET /api/live/state</code> 的 <code>events</code> 字段查看。</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+
+    <!-- 添加股票并绑定策略 -->
+    <div class="modal-overlay" x-show="stockBind.show" x-cloak @click.self="stockBind.show = false">
+        <div class="modal-card" style="max-width:400px;">
+            <div class="modal-header">
+                <div class="modal-title">添加股票并绑定策略</div>
+                <button type="button" class="modal-close" @click="stockBind.show = false">×</button>
+            </div>
+            <div class="modal-body text-sm">
+                <p class="text-xs text-gray-600 mb-2 leading-relaxed">写入监控列表与 <code>strategies.yaml</code> 并热加载；出<strong>买/卖信号</strong>时由主循环按该策略计算。</p>
+                <p class="text-xs text-gray-400 mb-3 leading-relaxed border-l-2 border-gray-200 pl-2">
+                    <strong>买入数量</strong>不由本弹窗填写：主循环里按风控用「总资金 × 10% ÷ 现价」折算成股数（100 股一手），不足一手时按至少 100 股试探；详见右侧「风控」卡片。
+                </p>
+                <div class="mb-3">
+                    <div class="text-xs text-gray-600 mb-1">股票代码</div>
+                    <input type="text" class="form-input w-full font-mono text-sm"
+                           x-model="stockBind.code"
+                           placeholder="例: 002432.SZ">
+                </div>
+                <div class="mb-4">
+                    <div class="text-xs text-gray-600 mb-1">策略</div>
+                    <template x-if="strategyFlat.length > 0">
+                        <select class="form-input w-full" style="font-size:13px;" x-model="stockBind.strategy">
+                            <option value="">请选择策略</option>
+                            <template x-for="s in strategyFlat" :key="'bindopt-' + s.name">
+                                <option :value="s.name" x-text="'[' + s.group + '] ' + s.label"></option>
+                            </template>
+                        </select>
+                    </template>
+                    <template x-if="strategyFlat.length === 0">
+                        <div class="text-gray-400 text-xs">策略列表加载中...</div>
+                    </template>
+                </div>
+                <div class="flex gap-2 justify-end">
+                    <button type="button" class="btn btn-secondary btn-sm" @click="stockBind.show = false">取消</button>
+                    <button type="button" class="btn btn-primary btn-sm" @click="confirmStockBind()">确定</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 策略详情 + 切换 (持仓表 / 绑定表 共用): 点策略名弹出, 直接看说明并切换 -->
+    <div class="modal-overlay" x-show="strategyDetailForPos.show" x-cloak
+         @click.self="strategyDetailForPos.show = false">
+        <div class="modal-card strategy-help-modal" style="max-width:480px;">
+            <div class="modal-header">
+                <div class="modal-title">
+                    策略说明
+                    <span class="text-xs text-gray-500 font-mono ml-2"
+                          x-show="strategyDetailForPos.code"
+                          x-text="strategyDetailForPos.code"></span>
+                </div>
+                <button type="button" class="modal-close" @click="strategyDetailForPos.show = false">×</button>
+            </div>
+            <div class="modal-body">
+                <div class="strategy-help-title">
+                    当前: <span x-text="strategyDetailForPos.label"></span>
+                </div>
+
+                <template x-if="strategyDetailForPos.scenario || strategyDetailForPos.rules || strategyDetailForPos.example">
+                    <div>
+                        <div class="strategy-help-block" x-show="strategyDetailForPos.scenario">
+                            <div class="strategy-help-label">适用场景</div>
+                            <p class="strategy-help-text" x-text="strategyDetailForPos.scenario"></p>
+                        </div>
+                        <div class="strategy-help-block" x-show="strategyDetailForPos.rules">
+                            <div class="strategy-help-label">规则说明</div>
+                            <p class="strategy-help-text" x-text="strategyDetailForPos.rules"></p>
+                        </div>
+                        <div class="strategy-help-block" x-show="strategyDetailForPos.example">
+                            <div class="strategy-help-label">示例</div>
+                            <p class="strategy-help-text" x-text="strategyDetailForPos.example"></p>
+                        </div>
+                    </div>
+                </template>
+                <template x-if="!(strategyDetailForPos.scenario || strategyDetailForPos.rules || strategyDetailForPos.example) && strategyDetailForPos.desc">
+                    <p class="strategy-help-text" x-text="strategyDetailForPos.desc"></p>
+                </template>
+
+                <!-- 直接切换为其他策略 (无需再去右侧表格) -->
+                <div class="strategy-help-block" style="border-top:1px solid #e5e7eb;padding-top:10px;margin-top:14px;"
+                     x-show="strategyDetailForPos.code">
+                    <div class="strategy-help-label">切换为其他策略</div>
+                    <div class="flex gap-2 mt-1.5">
+                        <select class="form-input flex-1" style="font-size:12px;padding:4px 8px;"
+                                x-model="strategyDetailForPos.switchTo">
+                            <option value="" style="color:#9ca3af;">(不绑定 — 该股不再出信号)</option>
+                            <template x-for="s in strategyFlat" :key="'sw-' + s.name">
+                                <option :value="s.name" x-text="'[' + s.group + '] ' + s.label"></option>
+                            </template>
+                        </select>
+                        <button type="button" class="btn btn-primary btn-sm"
+                                style="padding:4px 12px;font-size:12px;"
+                                @click="confirmSwitchStrategy()"
+                                :disabled="strategyDetailForPos.switchTo === resolvedExecStrategy(strategyDetailForPos.code)
+                                           && hasBinding(strategyDetailForPos.code) === !!strategyDetailForPos.switchTo">
+                            保存
+                        </button>
+                    </div>
+                    <p class="text-xs text-gray-500 mt-1.5 mb-0 leading-relaxed">
+                        选「<b>(不绑定)</b>」保存 = 解绑, 引擎不再出信号; 选具体策略 = 切换并热加载,
+                        下一轮循环 (约 1 分钟) 生效。配置写入 <code>strategies.yaml</code>。
+                    </p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 立即试算结果弹窗: 展示每只股票的 buy/sell/hold + 原因 -->
+    <div class="modal-overlay" x-show="trialResult !== null" x-cloak @click.self="trialResult = null">
+        <div class="modal-card" style="max-width:760px;">
+            <div class="modal-header">
+                <div class="modal-title">
+                    试算结果
+                    <span class="text-xs text-gray-500 ml-2" x-show="trialResult"
+                          x-text="'共 ' + (trialResult?.summary?.total || 0) + ' 只'"></span>
+                </div>
+                <button type="button" class="modal-close" @click="trialResult = null">×</button>
+            </div>
+            <div class="modal-body" x-show="trialResult">
+                <div class="text-xs text-gray-700 mb-3 leading-relaxed">
+                    引擎按当前最近一根 K 线对监控池里每只股票各跑一遍策略。
+                    <b class="text-emerald-700">buy</b> / <b class="text-rose-700">sell</b> 已写到下方「信号」表;
+                    <b class="text-gray-500">hold</b> 表示当前条件不满足, 不出信号 (这就是「为什么没看到信号」的常见原因)。
+                </div>
+                <div class="flex gap-3 text-sm mb-3">
+                    <span class="badge badge-success" x-text="'buy ' + (trialResult?.summary?.buy || 0)"></span>
+                    <span class="badge badge-danger"  x-text="'sell ' + (trialResult?.summary?.sell || 0)"></span>
+                    <span class="badge badge-info"    style="background:#f3f4f6;color:#374151;"
+                          x-text="'hold ' + (trialResult?.summary?.hold || 0)"></span>
+                    <template x-if="(trialResult?.summary?.error || 0) > 0">
+                        <span class="badge badge-danger"
+                              x-text="'error ' + trialResult.summary.error"></span>
+                    </template>
+                </div>
+                <table class="app-table" x-show="(trialResult?.diagnoses || []).length > 0">
+                    <thead><tr>
+                        <th>代码</th><th>策略</th><th>方向</th><th>原因</th>
+                    </tr></thead>
+                    <tbody>
+                        <template x-for="(d, i) in (trialResult?.diagnoses || [])" :key="i">
+                            <tr>
+                                <td><code x-text="d.code"></code></td>
+                                <td>
+                                    <span class="badge badge-info" style="font-size:10px;"
+                                          x-text="d.strategy"></span>
+                                </td>
+                                <td>
+                                    <span class="badge"
+                                          :class="d.side === 'buy' ? 'badge-success' :
+                                                  d.side === 'sell' ? 'badge-danger' :
+                                                  d.side === 'error' ? 'badge-danger' : ''"
+                                          :style="d.side === 'hold' ? 'background:#f3f4f6;color:#6b7280;' : ''"
+                                          x-text="d.side"></span>
+                                </td>
+                                <td class="text-xs text-gray-600" x-text="d.reason || '-'"></td>
+                            </tr>
+                        </template>
+                    </tbody>
+                </table>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-primary" @click="trialResult = null">知道了</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 实盘委托弹窗 (从「实盘账户」卡片头部按钮点开) -->
+    <div class="modal-overlay" x-show="showRealOrders" x-cloak @click.self="showRealOrders = false">
+        <div class="modal-card" style="max-width:780px;">
+            <div class="modal-header">
+                <div class="modal-title">
+                    今日委托 (miniQMT)
+                    <span class="text-xs text-gray-500 ml-2"
+                          x-text="(realAccount.orders || []).length + ' 笔'
+                                  + (pendingRealOrders().length ? ' · 未结 ' + pendingRealOrders().length : '')"></span>
+                </div>
+                <button type="button" class="modal-close" @click="showRealOrders = false">×</button>
+            </div>
+            <div class="modal-body">
+                <template x-if="(realAccount.orders || []).length === 0">
+                    <div class="text-gray-400 text-sm py-6 text-center">(今日暂无委托)</div>
+                </template>
+                <template x-if="(realAccount.orders || []).length > 0">
+                    <div class="overflow-x-auto">
+                    <table class="app-table">
+                        <thead><tr>
+                            <th>编号</th>
+                            <th>代码</th>
+                            <th>方向</th>
+                            <th class="text-right">委托</th>
+                            <th class="text-right">已成</th>
+                            <th class="text-right">价格</th>
+                            <th>状态</th>
+                            <th>操作</th>
+                        </tr></thead>
+                        <tbody>
+                            <template x-for="o in (realAccount.orders || [])" :key="o.order_id">
+                                <tr>
+                                    <td><code class="text-xs" x-text="o.order_id"></code></td>
+                                    <td><code x-text="o.stock_code"></code></td>
+                                    <td>
+                                        <span class="badge"
+                                              :class="o.side === 'buy' ? 'badge-danger' : 'badge-success'"
+                                              x-text="o.side === 'buy' ? '买' : (o.side === 'sell' ? '卖' : o.side)"></span>
+                                    </td>
+                                    <td class="text-right num" x-text="App.fmtNum(o.order_volume, 0)"></td>
+                                    <td class="text-right num" x-text="App.fmtNum(o.traded_volume, 0)"></td>
+                                    <td class="text-right num" x-text="o.price > 0 ? App.fmtNum(o.price, 2) : '市价'"></td>
+                                    <td>
+                                        <span class="text-xs"
+                                              :class="o.cancelable ? 'text-yellow-700' : (o.order_status === 57 ? 'text-green-700' : 'text-gray-500')"
+                                              x-text="o.status_text"></span>
+                                    </td>
+                                    <td>
+                                        <button type="button" class="btn btn-secondary btn-xs"
+                                                x-show="o.cancelable"
+                                                :disabled="cancelBusyId === o.order_id"
+                                                @click="cancelRealOrder(o)"
+                                                x-text="cancelBusyId === o.order_id ? '撤单中...' : '撤单'"></button>
+                                    </td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                    </div>
+                </template>
+                <p class="text-xs text-gray-400 mt-3 mb-0 leading-relaxed">
+                    数据来自 miniQMT <code>query_stock_orders()</code>, 自动 5 秒刷新。
+                    未结(未报/待报/已报/部成待撤) 可撤单; 已成 / 已撤为终态。
+                </p>
+            </div>
+        </div>
+    </div>
+
+    <!-- 实盘视图: 实时持仓 / 买入记录 / 监控池 / 监控明细 -->
+    <div class="text-xs text-red-700 mb-4">
+        实盘: 依赖 bigqmt 桥与已登录账户; 监控股满足策略买入规则时由主循环自动真实下单
+    </div>
+
+    <!-- ======== 实盘仪表盘 ======== -->
+    <!-- 列宽: 左列(持仓/买入记录/监控池)加宽 10%, 右列(资金面板/开盘买入任务)相应收窄 -->
+    <div class="grid-2" style="grid-template-columns: 17fr 12fr;">
+        <!-- 左侧: 持仓 + 盈亏曲线 + 信号订单 (系统状态已移到右侧) -->
+        <div class="flex-col">
+
+            <!-- 持仓: 只展示实际买入的成交持仓 (以实际买入为准) -->
+            <div class="card">
+                <div class="card-header">
+                    <div>
+                        <div class="card-title">实时持仓</div>
+                        <div class="card-subtitle">
+                            <span x-text="displayPositions().length + ' 只持仓'"></span>
+                            <span class="text-gray-400 ml-1">· 实际成交持仓</span>
+                        </div>
+                    </div>
+                </div>
+                <template x-if="displayPositions().length === 0">
+                    <div class="text-gray-400 text-sm py-6 text-center">(暂无实际买入持仓)</div>
+                </template>
+                <template x-if="displayPositions().length > 0">
+                    <div class="overflow-x-auto">
+                    <table class="app-table">
+                        <thead><tr>
+                            <th>代码</th><th>名称</th>
+                            <th class="text-right">数量</th>
+                            <th class="text-right">买入价格</th>
+                            <th class="text-right">总金额</th>
+                            <th class="text-right">现价</th>
+                            <th class="text-right">浮盈/亏</th>
+                            <th class="text-right">盈亏%</th>
+                        </tr></thead>
+                        <tbody>
+                            <template x-for="p in displayPositions()" :key="p.code">
+                                <tr>
+                                    <td><code x-text="p.code"></code></td>
+                                    <td x-text="p.name"></td>
+                                    <td class="text-right num" x-text="App.fmtNum(p.volume, 0)"></td>
+                                    <td class="text-right num" x-text="App.fmtNum(p.cost, 2)"></td>
+                                    <td class="text-right num" x-text="App.fmtNum(p.market_value, 0)"></td>
+                                    <td class="text-right num" x-text="App.fmtNum(p.cur_price, 2)"></td>
+                                    <td class="text-right num" :class="App.pnlClass(p.pnl)" x-text="App.fmtSign(p.pnl, 0)"></td>
+                                    <td class="text-right num" :class="App.pnlClass(p.pnl_pct)" x-text="App.fmtPct(p.pnl_pct, 2)"></td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                    </div>
+                </template>
+            </div>
+
+            <!-- 买入记录: 实际成交的买单 (代码 / 名称 / 买入时间 / 金额 / 买入理由) -->
+            <div class="card">
+                <div class="card-header">
+                    <div>
+                        <div class="card-title">买入记录</div>
+                        <div class="text-xs text-gray-500 font-normal mt-0.5">
+                            按时间倒序展示最近 30 笔实际买入成交的买单.
+                        </div>
+                    </div>
+                    <span class="text-xs text-gray-400" x-text="buyRecords().length + ' 笔'"></span>
+                </div>
+                <template x-if="buyRecords().length === 0">
+                    <div class="text-gray-400 text-sm py-3 text-center">(暂无买入记录 -- 等待盘中实际买入成交)</div>
+                </template>
+                <template x-if="buyRecords().length > 0">
+                    <table class="app-table">
+                        <thead><tr>
+                            <th style="width:150px;">买入时间</th>
+                            <th style="width:96px;">代码</th>
+                            <th style="width:120px;">名称</th>
+                            <th class="text-right" style="width:120px;">金额</th>
+                            <th>买入理由</th>
+                        </tr></thead>
+                        <tbody>
+                            <template x-for="(b, i) in buyRecords()" :key="i">
+                                <tr>
+                                    <td class="num text-xs" x-text="App.fmtSignalTs(b.ts)"></td>
+                                    <td><code x-text="b.code"></code></td>
+                                    <td class="text-xs" x-text="b.name || '-'"></td>
+                                    <td class="text-right num text-xs" x-text="App.fmtNum(b.amount, 2)"></td>
+                                    <td class="text-xs text-gray-600"
+                                        style="max-width:360px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"
+                                        :title="b.reason || ''"
+                                        x-text="b.reason || '-'"></td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                </template>
+            </div>
+
+            <!-- 监控池: 当日当前监控中的股票 (今日选股池) + 开盘价 + 买卖状态/原因 (原资金曲线位置) -->
+            <div class="card">
+                <div class="card-header">
+                    <div>
+                        <div class="card-title">监控池</div>
+                        <div class="text-xs text-gray-500 font-normal mt-0.5">
+                            当日当前监控中的股票 (来自今日各策略选股候选); 已买入在前.
+                        </div>
+                    </div>
+                    <span class="text-xs text-gray-400"
+                          x-text="dailyWatchRow().length + ' 只 · ' + (dailyWatch.monitor_date || '')"></span>
+                </div>
+                <template x-if="dailyWatchRow().length === 0">
+                    <div class="text-gray-400 text-xs py-3 text-center leading-relaxed">
+                        暂无当日监控<br/>
+                        <span class="text-gray-300">策略今日选出的候选会在这里出现</span>
+                    </div>
+                </template>
+                <template x-if="dailyWatchRow().length > 0">
+                    <div style="max-height:300px; overflow-y:auto;">
+                        <table class="app-table">
+                            <thead><tr>
+                                <th>股票</th><th>股票名称</th><th>策略</th>
+                                <th class="text-right">开盘价</th>
+                                <th>买卖状态</th><th>已买原因</th><th>未买原因</th>
+                            </tr></thead>
+                            <tbody>
+                                <template x-for="(w, i) in dailyWatchRow()" :key="i">
+                                    <tr>
+                                        <td><code class="text-xs" x-text="w.code"></code></td>
+                                        <td class="text-xs" x-text="w.name || '-'"></td>
+                                        <td class="text-xs">
+                                            <span class="badge badge-info" style="font-size:10px;"
+                                                  x-text="w.strategy_label || w.strategy || '-'"></span>
+                                        </td>
+                                        <td class="text-right num text-xs"
+                                            x-text="w.open_price != null ? App.fmtNum(w.open_price, 2) : '-'"></td>
+                                        <td class="text-xs">
+                                            <span class="badge" style="font-size:10px;"
+                                                  :class="Number(w.bought) ? 'badge-success' : 'badge-gray'"
+                                                  x-text="Number(w.bought) ? '已买' : '未买'"></span>
+                                        </td>
+                                        <td class="text-xs text-emerald-700"
+                                            style="max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"
+                                            :title="w.buy_reason || ''"
+                                            x-text="w.buy_reason || '-'"></td>
+                                        <td class="text-xs text-gray-600"
+                                            style="max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"
+                                            :title="w.not_buy_reason || ''"
+                                            x-text="w.not_buy_reason || '-'"></td>
+                                    </tr>
+                                </template>
+                            </tbody>
+                        </table>
+                    </div>
+                </template>
+            </div>
+
+        </div>
+
+        <!-- 右侧: 快速指南 + 系统状态 + 运行控制 + 策略路由 + 应急 -->
+        <div class="flex-col">
+
+            <!-- 资金面板 (合并 = 资产视图 + 运行控制 + 操作链接)
+                 设计目标: 用一张卡装下"我现在多少钱 / 引擎在不在跑 / 出问题怎么停",
+                 不再单独立"运行控制 / 快速指南"卡, 减少视觉噪音 -->
+            <div class="card">
+                <div class="card-header" style="padding-bottom:0.6rem;">
+                    <div class="flex items-center gap-2">
+                        <div class="card-title">资金面板</div>
+                        <span class="badge text-xs"
+                              :class="brokerConnected() ? 'badge-success' : 'badge-danger'"
+                              :title="brokerError() || (brokerConnected() ? '国金 miniQMT 已连接' : '国金 miniQMT 未连接')">
+                            <span x-text="brokerConnected() ? '● QMT 已连接' : '○ QMT 未连接'"></span>
+                        </span>
+                    </div>
+                    <div class="flex items-center gap-1">
+                        <button type="button" class="btn btn-secondary"
+                                style="padding:2px 10px;font-size:11px;line-height:1.3;"
+                                @click="reconnectQmt()" title="断开并重新连接国金 miniQMT">重连 QMT</button>
+                        <button type="button" class="help-btn" @click="showHelp = true" title="使用说明">?</button>
+                    </div>
+                </div>
+
+                <!-- 总资产 (券商真实资金) -->
+                <div class="text-center pb-3 border-b border-gray-100">
+                    <div class="text-xs text-gray-500">总资产 <span class="text-gray-400">(国金证券)</span></div>
+                    <div class="text-3xl num font-bold leading-tight"
+                         x-text="App.fmtNum(displayTotalAssets(), 0)"></div>
+                    <div class="text-xs text-gray-400 mt-0.5" x-show="!brokerAssetValid()">
+                        未获取到券商资金数据
+                    </div>
+                </div>
+
+                <!-- 持仓市值 + 可用现金 (券商真实数据) -->
+                <div class="grid grid-cols-2 gap-3 text-sm pt-3 pb-3 border-b border-gray-100">
+                    <div>
+                        <div class="text-xs text-gray-500">持仓市值</div>
+                        <div class="num text-lg font-semibold text-indigo-700"
+                             x-text="App.fmtNum(displayHoldingsValue(), 0)"></div>
+                        <div class="text-xs text-gray-500">
+                            占 <span x-text="App.fmtPct(displayHoldingsRatio(), 1)"></span>
+                        </div>
+                    </div>
+                    <div>
+                        <div class="text-xs text-gray-500">可用现金</div>
+                        <div class="num text-lg font-semibold text-emerald-700"
+                             x-text="App.fmtNum(displayCash(), 0)"></div>
+                        <div class="text-xs text-gray-500">
+                            占 <span x-text="App.fmtPct(displayCashRatio(), 1)"></span>
+                            <span class="text-gray-400" x-show="displayCash() > 0"> · 可加仓</span>
+                        </div>
+                    </div>
+                    <div class="col-span-2 text-xs text-gray-500 flex flex-wrap items-center gap-x-3 gap-y-1 pt-1">
+                        <span>冻结资金 <span class="num" x-text="App.fmtNum(displayFrozen(), 0)"></span></span>
+                        <span class="text-gray-400">· 数据来源: 国金证券</span>
+                    </div>
+                </div>
+
+                <!-- QMT 连接明细: 心跳时间 + 账户 + 延迟 + 错误 (5 秒随 refresh 更新) -->
+                <div class="text-xs pt-2 flex flex-wrap items-center gap-x-3 gap-y-1"
+                     :class="brokerConnected() ? 'text-gray-500' : 'text-red-600'">
+                    <span>QMT 心跳
+                        <span class="num font-mono"
+                              x-text="brokerHeartbeat() ? App.fmtSignalTs(brokerHeartbeat()) : '-'"></span>
+                    </span>
+                    <span class="text-gray-400" x-show="brokerConnected()">账户
+                        <span class="num font-mono" x-text="(realAccount && realAccount.account_id) || '-'"></span>
+                    </span>
+                    <span class="num font-mono" x-show="brokerError()"
+                          x-text="brokerError()"></span>
+                    <span x-show="brokerConnected() && realAccount && realAccount.cached_age_sec >= 0"
+                          class="text-gray-400">· 数据延迟
+                        <span class="num" x-text="realAccount.cached_age_sec.toFixed(0)"></span>s
+                    </span>
+                </div>
+            </div>
+
+            <!-- 开盘买入窗口任务: 09:29-09:35 每股一个循环监控任务 (原监控池位置) -->
+            <div class="card">
+                <div class="card-header">
+                    <div>
+                        <div class="card-title">开盘买入窗口任务 <span class="text-gray-400 font-normal">(09:29-09:35)</span></div>
+                        <div class="text-xs text-gray-500 font-normal mt-0.5">
+                            每股一个独立监控任务, 每 15 秒判定一次; 触发买入下单(无论成败)或到 09:35 未触发, 该股任务即结束.
+                        </div>
+                    </div>
+                    <span class="badge text-xs"
+                          :class="openBuyWindow.running ? 'badge-success' : 'badge-gray'"
+                          x-text="openBuyWindow.running ? '运行中' : (openBuyWindow.running_text || '未启动')"></span>
+                </div>
+
+                <!-- 候选进度: 监控中 / 已下单 / 窗口结束 -->
+                <div class="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs mb-2">
+                    <span>候选 <b class="num" x-text="(openBuyWindow.candidates || []).length"></b> 只</span>
+                    <span class="text-sky-700">监控中 <b class="num" x-text="openBuyWindowActiveCount()"></b></span>
+                    <span class="text-emerald-700">已下单 <b class="num" x-text="openBuyWindowOrderedCount()"></b></span>
+                    <span class="text-gray-500">窗口结束 <b class="num" x-text="openBuyWindowWindowEndCount()"></b></span>
+                    <span class="text-gray-400" x-show="openBuyWindow.date">· <span x-text="openBuyWindow.date"></span></span>
+                </div>
+                <template x-if="openBuyWindow.last_error">
+                    <div class="text-xs text-red-600 mb-2" x-text="'异常: ' + openBuyWindow.last_error"></div>
+                </template>
+
+                <!-- 每只候选的判定详情 -->
+                <template x-if="(openBuyWindow.stocks || []).length === 0">
+                    <div class="text-gray-400 text-xs py-3 text-center leading-relaxed">
+                        窗口未启动或今日无弱转强候选<br/>
+                        <span class="text-gray-300">09:29 后每股自动创建独立监控任务, 每 15 秒判定</span>
+                    </div>
+                </template>
+                <template x-if="(openBuyWindow.stocks || []).length > 0">
+                    <div style="max-height:260px; overflow-y:auto;">
+                        <table class="app-table">
+                            <thead><tr>
+                                <th>代码</th><th>名称</th>
+                                <th class="text-right">开盘价</th>
+                                <th>任务状态</th><th>原因</th>
+                            </tr></thead>
+                            <tbody>
+                                <template x-for="(st, i) in openBuyWindowRows()" :key="i">
+                                    <tr>
+                                        <td><code class="text-xs" x-text="st.code"></code></td>
+                                        <td class="text-xs" x-text="st.name || '-'"></td>
+                                        <td class="text-right num text-xs"
+                                            x-text="st.open_price != null ? App.fmtNum(st.open_price, 2) : '-'"></td>
+                                        <td class="text-xs">
+                                            <span class="badge" style="font-size:10px;"
+                                                  :class="openBuyWindowStatusClass(st)"
+                                                  x-text="st.task_status_text || (Number(st.bought) ? '已下单' : '未买')"></span>
+                                        </td>
+                                        <td class="text-xs"
+                                            :class="openBuyWindowReasonClass(st)"
+                                            style="max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"
+                                            :title="openBuyWindowReason(st) || ''"
+                                            x-text="openBuyWindowReason(st) || '-'"></td>
+                                    </tr>
+                                </template>
+                            </tbody>
+                        </table>
+                    </div>
+                </template>
+            </div>
+
+            <!-- (运行控制 / 股票与策略 / 快速指南 三张卡片已合并:
+                 · 启动/停止/状态 -> 资金面板头部
+                 · 快速指南完整版 -> 右上角 ? 帮助弹窗) -->
+            <template x-if="strategiesLoadError">
+                <div class="card" style="border-color:#fecaca;">
+                    <div class="text-red-600 text-xs" x-text="strategiesLoadError"></div>
+                </div>
+            </template>
+
+            <!-- 风控 / 熔断 / 下单 (固定说明) -->
+            <div class="card">
+                <div class="card-title mb-3">风控 / 熔断 / 下单</div>
+                <div class="text-xs text-gray-700 space-y-2">
+                    <div class="flex items-start gap-2">
+                        <span class="badge badge-warning" style="min-width:36px;text-align:center;">风控</span>
+                        <span>单笔买入金额 ≤ 总资金 10%；股数按「该上限 ÷ 现价」向下取整到 100 股一手, 算出来不足一手时按 100 股试探</span>
+                    </div>
+                    <div class="flex items-start gap-2">
+                        <span class="badge badge-danger" style="min-width:36px;text-align:center;">熔断</span>
+                        <span>当日亏损 ≤ -2% 自动 HALTED</span>
+                    </div>
+                    <div class="flex items-start gap-2">
+                        <span class="badge badge-success" style="min-width:36px;text-align:center;">下单</span>
+                        <span>模拟模式: 写到订单表, 不连券商</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 龙头战法候选 (CASE-C) -->
+            <div class="card">
+                <div class="card-header" style="cursor:pointer;border-bottom:none;padding-bottom:0;margin-bottom:0;"
+                     @click="dragon.show = !dragon.show">
+                    <div class="card-title flex items-center gap-2">
+                        <span x-text="dragon.show ? '▼' : '▶'" class="text-xs text-gray-400"></span>
+                        龙头战法候选
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <span x-show="dragon.tradeDate" class="badge badge-gray text-xs"
+                              x-text="dragon.tradeDate"></span>
+                        <span class="badge badge-info" x-text="dragon.items.length + ' 只'"></span>
+                    </div>
+                </div>
+                <div x-show="dragon.show" x-cloak class="mt-3" x-transition>
+                    <div class="text-xs text-gray-600 mb-2 leading-relaxed">
+                        <b>选股</b>: 涨幅 / 量比 / 价位 / 流通市值 / 排除 ST + 排除涨停板 / 次新股 / <b>板块共振</b><br/>
+                        <b>战法</b>: 「一键加入监控」会自动把这些股票绑成 <code>dragon_picker</code> 策略 -- 主循环下一轮起,
+                        对它们用<b>入场</b> (涨幅&gt;5% &amp; 量比&gt;2 &amp; 价位&lt;30 &amp; 龙头分≥1.5)
+                        和<b>出场</b> (当日跌幅&gt;3% 或 从当日最高回撤&gt;3%) 自动算信号
+                    </div>
+                    <div class="text-xs mb-2"
+                         :class="dragon.source === 'mock' ? 'text-orange-600' : 'text-gray-500'">
+                        <template x-if="dragon.source === 'mysql'">
+                            <span>数据源: <b>MySQL</b> 最近一个真实交易日 (板块共振开)</span>
+                        </template>
+                        <template x-if="dragon.source === 'xtdata'">
+                            <span>数据源: <b>xtdata</b> 实时盘中 (盘中无板块行情, 已自动关闭共振过滤)</span>
+                        </template>
+                        <template x-if="dragon.source === 'mock'">
+                            <span>数据源: <b>教学样本</b> -- MySQL/xtdata 都不可用时的兜底, 仅作演示</span>
+                        </template>
+                    </div>
+                    <div class="flex items-center gap-2 mb-2 flex-wrap">
+                        <label class="text-xs text-gray-600 flex items-center gap-1">
+                            数据源
+                            <select class="form-input" style="font-size:12px;padding:2px 6px;height:auto;"
+                                    x-model="dragon.sourceMode">
+                                <option value="auto">自动 (默认)</option>
+                                <option value="mysql">MySQL 最近交易日</option>
+                                <option value="xtdata">xtdata 实时</option>
+                                <option value="mock">mock 教学样本</option>
+                            </select>
+                        </label>
+                        <button class="btn btn-secondary btn-sm" @click="loadDragonCandidates()" :disabled="dragon.loading">
+                            <span x-show="!dragon.loading">刷新候选</span>
+                            <span x-show="dragon.loading">加载中...</span>
+                        </button>
+                        <button class="btn btn-primary btn-sm ml-auto"
+                                :disabled="dragon.items.length === 0 || dragon.binding"
+                                @click="bindDragonAll()"
+                                title="把候选写入 watch_pool 并绑 dragon_picker 策略, 主循环下一轮自动盯">
+                            <span x-show="!dragon.binding">一键加入监控 (自动绑 dragon_picker)</span>
+                            <span x-show="dragon.binding">写入中...</span>
+                        </button>
+                    </div>
+                    <template x-if="dragon.warning">
+                        <div class="text-xs text-orange-600 mb-2"
+                             x-text="'数据源回退说明: ' + dragon.warning"></div>
+                    </template>
+                    <template x-if="dragon.items.length === 0">
+                        <div class="text-gray-400 text-sm py-4 text-center">(点「刷新候选」)</div>
+                    </template>
+                    <template x-if="dragon.items.length > 0">
+                        <div style="max-height: 240px; overflow-y: auto;">
+                            <table class="app-table text-xs">
+                                <thead><tr>
+                                    <th>代码</th><th>名称</th>
+                                    <th class="text-right">涨幅</th>
+                                    <th class="text-right">量比</th>
+                                    <th class="text-right">价</th>
+                                    <th>板块</th>
+                                    <th class="text-right">板块涨</th>
+                                    <th class="text-right">分</th>
+                                </tr></thead>
+                                <tbody>
+                                    <template x-for="r in dragon.items" :key="'dg-' + r.code">
+                                        <tr>
+                                            <td><code x-text="r.code"></code></td>
+                                            <td x-text="r.name"></td>
+                                            <td class="text-right num pos" x-text="App.fmtPct(r.day_change_pct, 2)"></td>
+                                            <td class="text-right num" x-text="App.fmtNum(r.volume_ratio, 1)"></td>
+                                            <td class="text-right num" x-text="App.fmtNum(r.price, 2)"></td>
+                                            <td x-text="r.sector_2 || '-'"></td>
+                                            <td class="text-right num" x-text="r.sector_change_pct == null ? '-' : App.fmtPct(r.sector_change_pct, 2)"></td>
+                                            <td class="text-right num" x-text="App.fmtSign(r.dragon_score, 2)"></td>
+                                        </tr>
+                                    </template>
+                                </tbody>
+                            </table>
+                        </div>
+                    </template>
+                </div>
+            </div>
+
+            <!-- 事件流 / 告警 (按级别上色) -->
+            <div class="card">
+                <div class="card-header" style="cursor:pointer;border-bottom:none;padding-bottom:0;margin-bottom:0;"
+                     @click="showEvents = !showEvents">
+                    <div class="card-title flex items-center gap-2">
+                        <span x-text="showEvents ? '▼' : '▶'" class="text-xs text-gray-400"></span>
+                        事件流 / 告警
+                    </div>
+                    <span class="badge badge-gray" x-text="(state.events || []).length + ' 条'"></span>
+                </div>
+                <div x-show="showEvents" x-cloak class="mt-3" x-transition>
+                    <div class="text-xs text-gray-500 mb-2">主循环每轮 + control/status 操作 + 推送告警 (CASE-B) 都会写入这里</div>
+                    <template x-if="(state.events || []).length === 0">
+                        <div class="text-gray-400 text-sm py-4 text-center">(暂无事件，实盘引擎运行后会陆续写入)</div>
+                    </template>
+                    <template x-if="(state.events || []).length > 0">
+                        <div style="max-height: 280px; overflow-y: auto;">
+                            <template x-for="(e, idx) in (state.events || []).slice().reverse().slice(0, 30)" :key="'ev-' + idx">
+                                <div class="flex items-start gap-2 py-1 text-xs border-b border-gray-100 last:border-0">
+                                    <span class="badge" style="min-width:54px;text-align:center;flex-shrink:0;"
+                                          :class="App.alertBadgeClass(e)" x-text="App.alertLevelText(e)"></span>
+                                    <span class="text-gray-400 font-mono" x-text="App.alertTimeText(e)" style="min-width:60px;flex-shrink:0;"></span>
+                                    <span class="text-gray-700" style="word-break:break-all;" x-text="App.alertMsgText(e)"></span>
+                                </div>
+                            </template>
+                        </div>
+                    </template>
+                </div>
+            </div>
+
+            <!-- 应急干预 (默认折叠 -- 平时不用看到) -->
+            <div class="card" style="border-color: #fee2e2;">
+                <div class="card-header" style="cursor:pointer;border-bottom:none;padding-bottom:0;margin-bottom:0;"
+                     @click="showEmergency = !showEmergency">
+                    <div class="card-title flex items-center gap-2">
+                        <span x-text="showEmergency ? '▼' : '▶'" class="text-xs text-gray-400"></span>
+                        应急干预
+                    </div>
+                    <span class="badge badge-warning">平时不用</span>
+                </div>
+                <div x-show="showEmergency" x-cloak class="mt-3" x-transition>
+                    <div class="text-xs text-gray-500 mb-3">
+                        类似汽车手刹 -- 黑天鹅 / 策略失效 / 亏损过大时才用
+                    </div>
+
+                    <div class="grid grid-cols-2 gap-2">
+                        <button class="btn btn-secondary btn-sm" @click="ctrl('pause_buying', true)" title="只阻止 buy 信号, sell 仍执行">暂停买入</button>
+                        <button class="btn btn-secondary btn-sm" @click="ctrl('pause_buying', false)">恢复买入</button>
+                        <button class="btn btn-secondary btn-sm" @click="setStatus('PAUSED')" title="整个循环跳过">暂停交易</button>
+                        <button class="btn btn-primary btn-sm" @click="setStatus('RUNNING')">恢复交易</button>
+                        <button class="btn btn-danger btn-sm" @click="confirmDanger('force_clear_all')" title="所有持仓尽快平仓">一键清仓</button>
+                        <button class="btn btn-danger btn-sm" @click="confirmDanger('HALTED')" title="HALTED, 必须人工解除">强制熔断</button>
+                    </div>
+                    <button class="btn btn-success btn-sm w-full mt-2" @click="setStatus('RUNNING')">解除熔断</button>
+
+                    <div class="mt-3 text-xs text-gray-500 font-mono"
+                         style="word-break: break-all; max-height: 120px; overflow-y: auto;"
+                         x-show="opLog" x-text="opLog"></div>
+                </div>
+            </div>
+
+        </div>
+    </div>
+</div>
+
+<script>
+function liveApp() {
+    return {
+        showHelp: false,
+        showEmergency: false,   // 应急干预 默认折叠
+        showEvents: false,      // 事件流 默认折叠
+        realHelpOpen: false,    // /live/real "为什么没连上" 折叠提示
+        dragon: {               // 龙头战法面板 (CASE-C)
+            show: false, loading: false, binding: false,
+            // sourceMode: 'auto' (默认) / 'mysql' / 'xtdata' / 'mock'
+            sourceMode: 'auto',
+            source: '', tradeDate: '', warning: '', items: [],
+        },
+        viewMode: 'real',  // 恒为实盘视图 (已取消模拟盘)
+        realAccount: {          // 实盘视图: 来自 miniQMT 的真实账户 (5 秒缓存, 后端 /api/live/real_account)
+            connected: false, error: null, asset: {}, positions: [], orders: [], cached_age_sec: -1,
+        },
+        approvals: [],          // 实盘视图: AI 信号待授权列表 (后端 /api/live/approvals)
+        approvalBusyId: '',     // 正在处理的信号 id (用于按钮 disabled, 防重复点)
+        cancelBusyId: 0,        // 正在撤单的 order_id (按钮 disabled, 防重复)
+        showRealOrders: false,  // 实盘委托弹窗 (从「实盘账户」头部点开)
+        trialBusy: false,       // 「立即试算一轮」按钮 loading 态 (按钮已下线, 弹窗模板留作其他场景)
+        trialResult: null,      // 试算结果 {summary, diagnoses}, 非 null 时弹窗显示
+        // (signalRange / orderRange today/all 切换已下线: 信号默认倒序展示 30 条, 订单 20 条)
+        showStratHelp: false,
+        state: {},
+        simWatch: '',
+        simWatchDebounceTimer: null,
+        mergedList: [],
+        bindingSource: {},  // {code: 'sim'|'real'}, 决定「待入场」是否显示该 code
+        watchPoolText: '',
+        dailyWatch: { items: [], names: {}, monitor_date: '' },  // 当日监控(选股池) + 代码→名称映射
+        openBuyWindow: {  // 开盘买入窗口(09:29-09:35)任务进度 (后端 /api/live/open_buy_window)
+            running: false, running_text: '未启动', cycle_seconds: 15,
+            last_cycle_at: null, last_error: null, date: '',
+            window_start: '09:29', window_end: '09:35',
+            candidates: [], stocks: [], orders: [],
+        },
+        lastUpdate: '-',
+        opLog: '',
+        chart: null,
+
+        // ---- 资金面板 (派生自 state, 不查后端) ----
+        // capital = 初始本金, today_pnl = 持仓浮盈合计 (元), 所以 总资产 = 初始 + 浮盈
+        // 持仓市值 = positions[].market_value 之和; 现金 = 总资产 - 持仓市值
+        totalAssets() {
+            const cap = Number(this.state && this.state.capital) || 0;
+            const pnl = Number(this.state && this.state.today_pnl) || 0;
+            return cap + pnl;
+        },
+        holdingsValue() {
+            const ps = (this.state && this.state.positions) || [];
+            return ps.reduce((s, p) => s + (Number(p.market_value) || 0), 0);
+        },
+        cashAvailable() {
+            return Math.max(0, this.totalAssets() - this.holdingsValue());
+        },
+        holdingsRatio() {
+            const t = this.totalAssets();
+            return t > 0 ? this.holdingsValue() / t : 0;
+        },
+        cashRatio() {
+            const t = this.totalAssets();
+            return t > 0 ? this.cashAvailable() / t : 0;
+        },
+
+        // ---- 国金资金 (对接 /api/live/real_account, 每 5 秒刷新; 只显示券商真实数据) ----
+        brokerConnected() {
+            return !!(this.realAccount && this.realAccount.connected);
+        },
+        brokerAssetValid() {
+            const a = (this.realAccount && this.realAccount.asset) || {};
+            return Number(a.total_asset) > 0;
+        },
+        // 以下全部以国金证券真实数据为准, 不做估算回退
+        displayTotalAssets() {
+            const a = (this.realAccount && this.realAccount.asset) || {};
+            return Number(a.total_asset) || 0;
+        },
+        displayHoldingsValue() {
+            const a = (this.realAccount && this.realAccount.asset) || {};
+            return Number(a.market_value) || 0;
+        },
+        displayCash() {
+            const a = (this.realAccount && this.realAccount.asset) || {};
+            return Number(a.cash) || 0;
+        },
+        displayFrozen() {
+            const a = (this.realAccount && this.realAccount.asset) || {};
+            return Number(a.frozen_cash) || 0;
+        },
+        // 比例按券商口径计算
+        displayHoldingsRatio() {
+            const t = this.displayTotalAssets();
+            return t > 0 ? this.displayHoldingsValue() / t : 0;
+        },
+        displayCashRatio() {
+            const t = this.displayTotalAssets();
+            return t > 0 ? this.displayCash() / t : 0;
+        },
+        brokerHeartbeat() {
+            return (this.state && this.state.health && this.state.health.last_heartbeat) || null;
+        },
+        brokerError() {
+            return (this.realAccount && this.realAccount.error) || '';
+        },
+
+        /** 重连 QMT (国金 miniQMT): 断开旧连接 -> 重新连接 -> 立即刷新真实账户 */
+        async reconnectQmt() {
+            try {
+                const r = await App.post('/api/live/real_reconnect', {});
+                if (r && r.ok) {
+                    App.toast('QMT 已重连成功', 'success');
+                } else {
+                    App.toast((r && r.message) || 'QMT 重连失败', 'danger');
+                }
+                await this.refreshRealAccount(true);
+            } catch (e) {
+                console.error('reconnectQmt', e);
+                App.toast('QMT 重连异常: ' + String(e && e.message || e), 'danger');
+            }
+        },
+
+        // ---- 策略路由 ----
+        strategyGroups: [],     // [{name: '技术指标', items: [{name, label, description}, ...]}, ...]
+        strategyFlat: [],       // [{name, label, group, description}, ...] (供 <select> 用)
+        strategiesLoadError: '', // API 失败时显示, 避免一直「加载中」
+        strategyConfig: { default: 'macd_5min', per_stock: {} },
+        // 持仓表「执行策略」点击后弹窗
+        strategyDetailForPos: {
+            show: false,
+            code: '',
+            label: '',
+            scenario: '',
+            rules: '',
+            example: '',
+            desc: '',
+            switchTo: '',
+        },
+        // 添加股票并绑定策略; source 决定写到候选池(watch_pool)还是实盘绑定 (默认 sim=候选池)
+        stockBind: { show: false, code: '', strategy: '', source: 'sim' },
+
+        openStockBind() {
+            // 勿整体替换 stockBind，否则弹窗内 select 的 x-model 可能丢绑定，确定时 strategy 为空导致绑定失败
+            this.stockBind.show = true;
+            this.stockBind.code = '';
+            this.stockBind.strategy = '';
+            this.stockBind.source = 'sim';
+        },
+
+        async confirmStockBind() {
+            const code = (this.stockBind.code || '').trim();
+            const strategy = (this.stockBind.strategy || '').trim();
+            const source = (this.stockBind.source === 'real') ? 'real' : 'sim';
+            if (!code) {
+                App.toast('请填写股票代码', 'warn');
+                return;
+            }
+            if (!strategy) {
+                App.toast('请选择策略', 'warn');
+                return;
+            }
+            try {
+                const r = await App.post('/api/live/stock/bind', { code, strategy, source });
+                if (r && typeof r === 'object' && r.ok) {
+                    this.opLog = r.message || '';
+                    App.toast(r.message || '已绑定', 'success');
+                    this.stockBind.show = false;
+                    if (r.per_stock && typeof r.per_stock === 'object') {
+                        this.strategyConfig.per_stock = { ...r.per_stock };
+                    }
+                    if (r.default) this.strategyConfig.default = r.default;
+                    await this.loadWatchPool();
+                    await this.refreshMergedWatch();
+                } else {
+                    let detail = (r && typeof r === 'object' && r.message)
+                        ? r.message
+                        : (typeof r === 'string' ? r : JSON.stringify(r || {}));
+                    const ds = String(detail);
+                    if (ds === 'Not Found' || /^HTTP 404/i.test(ds)) {
+                        detail = '接口 404：当前后端可能未加载 stock/bind。请重启 python app.py，并访问 ' + window.location.origin + '/api/live/ping 应看到 ok:true';
+                    }
+                    App.toast('绑定失败: ' + detail, 'danger');
+                }
+            } catch (e) {
+                console.error(e);
+                App.toast('请求失败: ' + (e && e.message ? e.message : String(e)), 'warn');
+            }
+        },
+
+        async init() {
+            await this.loadStrategies();
+            await this.loadWatchPool();
+            await this.refreshMergedWatch();
+            await this.refresh();
+            // 5 秒自动轮询
+            setInterval(() => this.refresh(), 5000);
+        },
+
+        async refresh() {
+            try {
+                this.state = await App.get('/api/live/state');
+                this.lastUpdate = new Date().toLocaleTimeString('zh-CN');
+                await this.refreshMergedWatch();
+                await this.refreshDailyWatch();
+                await this.refreshOpenBuyWindow();
+                // 仅当用户处在「实盘」视图时才轮询 miniQMT + 待授权信号
+                if (this.viewMode === 'real') {
+                    await this.refreshRealAccount();
+                    await this.refreshApprovals();
+                }
+            } catch (e) {
+                console.error(e);
+            }
+        },
+
+        /** 当日监控: 今日各策略候选 + 是否已买入 + 代码→名称映射 (供「监控池」「买入记录」用) */
+        async refreshDailyWatch() {
+            try {
+                const r = await App.get('/api/live/daily_watch');
+                if (r && typeof r === 'object') {
+                    this.dailyWatch = {
+                        items:        Array.isArray(r.items) ? r.items : [],
+                        names:        (r.names && typeof r.names === 'object') ? r.names : {},
+                        monitor_date: r.monitor_date || '',
+                    };
+                }
+            } catch (e) {
+                console.error('refreshDailyWatch', e);
+            }
+        },
+
+        /** 股票名称: 优先实时 state.positions, 再回落当日监控 names 映射 */
+        stockName(code) {
+            const ps = (this.state && this.state.positions) || [];
+            const hit = ps.find(p => p && p.code === code);
+            if (hit && hit.name) return hit.name;
+            return (this.dailyWatch.names || {})[code] || '';
+        },
+
+        /** 该代码对应的某笔成交的【买入理由】: 从信号里按 (code + 时间最接近) 关联 */
+        _buyReason(code, ts) {
+            const sigs = (this.state && this.state.signals) || [];
+            const t = ts ? Date.parse(String(ts)) : NaN;
+            let best = null, bestDiff = Infinity;
+            for (const s of sigs) {
+                if (!s || s.side !== 'buy' || s.code !== code) continue;
+                const d = Math.abs((t ? Date.parse(String(s.ts)) : 0) - (Number.isNaN(t) ? 0 : t));
+                if (d < bestDiff) { bestDiff = d; best = s; }
+            }
+            return (best && best.reason) ? best.reason : '';
+        },
+
+        /** 买入记录 = 实际已成交的买单 (只买单), 列: 代码/名称/买入时间/金额/买入理由 */
+        buyRecords() {
+            const buys = (this.state && this.state.orders || [])
+                .filter(o => o && o.side === 'buy')
+                .slice();
+            buys.sort((a, b) => String(b.ts || '').localeCompare(String(a.ts || '')));
+            return buys.slice(0, 30).map(o => ({
+                code:   o.code,
+                name:   this.stockName(o.code),
+                ts:     o.ts,
+                amount: (Number(o.quantity) || 0) * (Number(o.price) || 0),
+                reason: o.reason || this._buyReason(o.code, o.ts),
+            }));
+        },
+
+        /** 当日监控(选股池)表: 已买入的排前, 再按入选时间倒序 */
+        dailyWatchRow() {
+            return (this.dailyWatch.items || []).slice()
+                .sort((a, b) => Number(b.bought || 0) - Number(a.bought || 0)
+                    || String(b.selected_at || '').localeCompare(String(a.selected_at || '')));
+        },
+
+        /** 开盘买入窗口(09:29-09:35)任务进度 -- 读后端落盘状态 */
+        async refreshOpenBuyWindow() {
+            try {
+                const r = await App.get('/api/live/open_buy_window');
+                if (r && typeof r === 'object' && !r.error) {
+                    this.openBuyWindow = {
+                        running:      !!r.running,
+                        running_text: r.running_text || (r.running ? '运行中' : '未启动'),
+                        cycle_seconds: Number(r.cycle_seconds) || 15,
+                        last_cycle_at: r.last_cycle_at || null,
+                        last_error:   r.last_error || null,
+                        date:         r.date || '',
+                        window_start: r.window_start || '09:29',
+                        window_end:   r.window_end || '09:35',
+                        candidates:   Array.isArray(r.candidates) ? r.candidates : [],
+                        stocks:       Array.isArray(r.stocks) ? r.stocks : [],
+                        orders:       Array.isArray(r.orders) ? r.orders : [],
+                    };
+                }
+            } catch (e) {
+                console.error('refreshOpenBuyWindow', e);
+            }
+        },
+
+        /** 窗口任务: 候选判定详情 (监控中在前, 保持后端排序) */
+        openBuyWindowRows() {
+            return (this.openBuyWindow.stocks || []).slice();
+        },
+
+        /** 窗口任务: 监控中的任务数 */
+        openBuyWindowActiveCount() {
+            return (this.openBuyWindow.stocks || [])
+                .filter(s => (s.task_status || 'monitoring') === 'monitoring').length;
+        },
+
+        /** 窗口任务: 已下单(无论成败, 任务结束)的数量 */
+        openBuyWindowOrderedCount() {
+            return (this.openBuyWindow.stocks || [])
+                .filter(s => s.task_status === 'ordered').length;
+        },
+
+        /** 窗口任务: 窗口结束未买的数量 */
+        openBuyWindowWindowEndCount() {
+            return (this.openBuyWindow.stocks || [])
+                .filter(s => s.task_status === 'window_end').length;
+        },
+
+        /** 窗口任务: 每股任务状态的徽章颜色 */
+        openBuyWindowStatusClass(st) {
+            const s = st.task_status || (Number(st.bought) ? 'ordered' : 'monitoring');
+            if (s === 'ordered') return Number(st.bought) ? 'badge-success' : 'badge-warning';
+            if (s === 'window_end') return 'badge-gray';
+            if (s === 'error') return 'badge-danger';
+            return 'badge-info';   // monitoring 监控中
+        },
+
+        /** 窗口任务: 每股任务状态的原因文案颜色 */
+        openBuyWindowReasonClass(st) {
+            const s = st.task_status || (Number(st.bought) ? 'ordered' : 'monitoring');
+            if (s === 'ordered' && Number(st.bought)) return 'text-emerald-700';
+            if (s === 'ordered') return 'text-amber-700';
+            return 'text-gray-600';
+        },
+
+        /** 窗口任务: 每股状态原因 (已买/下单失败/未触发/窗口结束) */
+        openBuyWindowReason(st) {
+            const s = st.task_status || (Number(st.bought) ? 'ordered' : 'monitoring');
+            if (s === 'ordered') {
+                if (Number(st.bought)) return st.buy_reason || '已买入';
+                return st.not_buy_reason || ('下单' + (st.order_status || '失败'));
+            }
+            return st.not_buy_reason || (s === 'monitoring' ? '等待判定' : '');
+        },
+
+        /** 拉 miniQMT 真实账户 + 持仓 (后端 5 秒缓存, 频繁调用安全)
+         *  force=true 时仍走同一接口, 后端缓存到期后会重连查询 */
+        async refreshRealAccount(force) {
+            try {
+                const r = await App.get('/api/live/real_account');
+                if (r && typeof r === 'object') {
+                    this.realAccount = {
+                        connected: !!r.connected,
+                        error:     r.error || null,
+                        asset:     r.asset || {},
+                        positions: Array.isArray(r.positions) ? r.positions : [],
+                        orders:    Array.isArray(r.orders) ? r.orders : [],
+                        cached_age_sec: typeof r.cached_age_sec === 'number' ? r.cached_age_sec : -1,
+                    };
+                    if (force) {
+                        App.toast(r.connected ? 'miniQMT 数据已刷新' : ('miniQMT 未连接: ' + (r.error || '未知')),
+                                  r.connected ? 'success' : 'warn');
+                    }
+                }
+            } catch (e) {
+                console.error('refreshRealAccount', e);
+                this.realAccount.connected = false;
+                this.realAccount.error = String(e && e.message || e);
+            }
+        },
+
+        /** 拉 AI 信号待授权列表 (实盘视图专用); 后端汇总最近 30 条 buy/sell 信号 + approval 状态 */
+        async refreshApprovals(toastOnDone) {
+            try {
+                const r = await App.get('/api/live/approvals');
+                this.approvals = (r && Array.isArray(r.items)) ? r.items : [];
+                if (toastOnDone) App.toast('已刷新 ' + this.approvals.length + ' 条信号', 'info');
+            } catch (e) {
+                console.error('refreshApprovals', e);
+                if (toastOnDone) App.toast('刷新失败: ' + (e && e.message ? e.message : e), 'warn');
+            }
+        },
+
+        pendingApprovals() {
+            return (this.approvals || []).filter(it => it.status === 'pending');
+        },
+        processedApprovals() {
+            return (this.approvals || []).filter(it => it.status !== 'pending');
+        },
+        approvalStats() {
+            const s = { pending: 0, approved: 0, rejected: 0, expired: 0 };
+            (this.approvals || []).forEach(it => { if (s[it.status] !== undefined) s[it.status] += 1; });
+            return s;
+        },
+
+        async approveSignal(it) {
+            if (!it || !it.id) return;
+            const tip = '确认走 miniQMT 真实下单?\n\n'
+                      + (it.side === 'buy' ? '买入' : '卖出') + ' ' + it.code + ' '
+                      + it.suggested_quantity + ' 股 @ '
+                      + (it.suggested_price > 0 ? it.suggested_price.toFixed(2) : '市价');
+            if (!window.confirm(tip)) return;
+            this.approvalBusyId = it.id;
+            try {
+                const r = await App.post('/api/live/approvals/approve', { id: it.id });
+                App.toast(r.message || (r.ok ? '已下单' : '下单失败'), r.ok ? 'success' : 'danger');
+                await this.refreshApprovals();
+                if (r.ok) await this.refreshRealAccount(false);
+            } catch (e) {
+                App.toast('请求失败: ' + (e && e.message ? e.message : e), 'danger');
+            } finally {
+                this.approvalBusyId = '';
+            }
+        },
+
+        async rejectSignal(it) {
+            if (!it || !it.id) return;
+            this.approvalBusyId = it.id;
+            try {
+                const r = await App.post('/api/live/approvals/reject', { id: it.id });
+                App.toast(r.message || '已拒绝', r.ok ? 'info' : 'warn');
+                await this.refreshApprovals();
+            } catch (e) {
+                App.toast('请求失败: ' + (e && e.message ? e.message : e), 'danger');
+            } finally {
+                this.approvalBusyId = '';
+            }
+        },
+
+        /** 拿策略中文标签 (用 strategyFlat 已加载好的; 没找到就回原 name) */
+        strategyLabel(name) {
+            if (!name) return '';
+            const hit = (this.strategyFlat || []).find(s => s.name === name);
+            return hit ? hit.label : name;
+        },
+
+        /** 从服务端读自选池到文本框 (仅 init 调用, 避免覆盖用户未保存编辑) */
+        async loadWatchPool() {
+            try {
+                const d = await App.get('/api/live/watch_pool');
+                const arr = d && Array.isArray(d.codes) ? d.codes : [];
+                this.watchPoolText = arr.join(',');
+            } catch (e) {
+                console.error('loadWatchPool', e);
+            }
+        },
+
+        async saveWatchPool() {
+            const raw = (this.watchPoolText || '').replace(/\r?\n/g, ',').replace(/，/g, ',');
+            try {
+                const r = await App.post('/api/live/watch_pool', { codes: raw });
+                if (!r || typeof r !== 'object') {
+                    App.toast('保存失败: 服务返回异常', 'warn');
+                    return;
+                }
+                this.opLog = r.message || '';
+                App.toast(r.ok ? (r.message || '已保存') : (r.message || '保存失败'), r.ok ? 'success' : 'warn');
+                if (r.ok) await this.refreshMergedWatch();
+            } catch (e) {
+                console.error(e);
+                App.toast('保存失败: ' + (e && e.message ? e.message : String(e)), 'warn');
+            }
+        },
+
+        /** 与后端 merge_watch_codes 一致: 额外监控 + 持仓 + 自选 + 路由键 */
+        async refreshMergedWatch() {
+            try {
+                const ui = encodeURIComponent(this.simWatch || '');
+                const res = await App.get('/api/live/watch_merge?ui=' + ui);
+                this.mergedList = Array.isArray(res.merged) ? res.merged : [];
+                this.bindingSource = (res && res.binding_source) ? res.binding_source : {};
+            } catch (e) {
+                console.error('refreshMergedWatch', e);
+                this.mergedList = [];
+                this.bindingSource = {};
+            }
+        },
+
+        /** 临时代码输入防抖, 减少手动点「刷新列表」 */
+        onSimWatchDebounced() {
+            clearTimeout(this.simWatchDebounceTimer);
+            this.simWatchDebounceTimer = setTimeout(() => {
+                this.refreshMergedWatch();
+            }, 450);
+        },
+
+        async loadStrategies() {
+            this.strategiesLoadError = '';
+            try {
+                const reg = await App.get('/api/live/strategies/registry');
+                if (!reg || typeof reg !== 'object' || !Array.isArray(reg.flat)) {
+                    this.strategiesLoadError = '策略接口返回异常 (请确认已重启到新版 app, 且访问端口与后端一致)';
+                    return;
+                }
+                // 把 {group: [items]} 转成数组, 保持原始注册顺序
+                this.strategyGroups = Object.entries(reg.groups || {}).map(
+                    ([name, items]) => ({ name, items })
+                );
+                this.strategyFlat = reg.flat;
+                const cfg = await App.get('/api/live/strategies/config');
+                if (!cfg || typeof cfg !== 'object') {
+                    this.strategiesLoadError = '路由配置接口返回异常';
+                    return;
+                }
+                this.strategyConfig = {
+                    default:   cfg.default || 'macd_5min',
+                    per_stock: cfg.per_stock || {},
+                };
+            } catch (e) {
+                console.error('loadStrategies failed', e);
+                this.strategiesLoadError = '加载策略失败: ' + (e && e.message ? e.message : String(e))
+                    + ' (检查网络与 /api/live/strategies/registry 是否可访问)';
+            }
+        },
+
+        watchCodes() {
+            return (this.simWatch || '')
+                .split(',')
+                .map(c => c.trim())
+                .filter(c => c.length > 0);
+        },
+
+        /** 当前路由下该代码对应的策略 id (per_stock 优先, 否则 default) */
+        resolvedExecStrategy(code) {
+            const ps = this.strategyConfig.per_stock || {};
+            return ps[code] || this.strategyConfig.default || 'macd_5min';
+        },
+
+        /** 持仓表「执行策略」列: 显示中文 label */
+        resolvedExecStrategyLabel(code) {
+            const name = this.resolvedExecStrategy(code);
+            const m = (this.strategyFlat || []).find(s => s.name === name);
+            return m ? m.label : name;
+        },
+
+        openPositionStrategyModal(code) {
+            const name = this.resolvedExecStrategy(code);
+            const meta = (this.strategyFlat || []).find(s => s.name === name);
+            // 整体替换 strategyDetailForPos 是 OK 的: 内层 select x-model="strategyDetailForPos.switchTo"
+            // 走属性访问, Alpine 在 modal 显示瞬间会重新求值, 不存在 stockBind 那种 select 跑空的问题.
+            this.strategyDetailForPos = {
+                show: true,
+                code: code || '',
+                label: meta ? meta.label : name,
+                scenario: meta && meta.scenario ? meta.scenario : '',
+                rules: meta && meta.rules ? meta.rules : '',
+                example: meta && meta.example ? meta.example : '',
+                desc: meta ? meta.description : '（暂无说明, 请检查策略是否已加载）',
+                switchTo: name,
+            };
+        },
+
+        /** 弹窗里点「保存」:
+         *  - target 为空 -> 走 /stock/unbind 解绑 (从 per_stock + watch_pool 移除)
+         *  - target 非空 -> 改 per_stock[code], 调 /strategies/config 热加载
+         */
+        async confirmSwitchStrategy() {
+            const code = (this.strategyDetailForPos.code || '').trim();
+            const target = (this.strategyDetailForPos.switchTo || '').trim();
+            if (!code) return;
+            if (!target) {
+                await this.confirmUnbindStrategy();
+                return;
+            }
+            const ps = { ...(this.strategyConfig.per_stock || {}) };
+            ps[code] = target;
+            const payload = { default: this.strategyConfig.default, per_stock: ps };
+            try {
+                const r = await App.post('/api/live/strategies/config', payload);
+                if (r && r.ok) {
+                    this.strategyConfig.per_stock = ps;
+                    this.opLog = r.message || '';
+                    App.toast(code + ' 已切换为: ' + (this.resolvedExecStrategyLabel(code)), 'success');
+                    this.strategyDetailForPos.show = false;
+                } else {
+                    App.toast('切换失败: ' + ((r && r.message) || '未知错误'), 'danger');
+                }
+            } catch (e) {
+                console.error(e);
+                App.toast('请求失败: ' + (e && e.message ? e.message : String(e)), 'danger');
+            }
+        },
+
+        /** 实盘持仓: 现价 = 市值 / 持仓 (miniQMT positions 字段没单独的现价, 用市值反算)
+         *  返回 0 表示没法算 (volume 为 0 等异常) */
+        realPosCurPrice(p) {
+            const v = Number(p && p.volume) || 0;
+            const mv = Number(p && p.market_value) || 0;
+            if (v <= 0 || mv <= 0) return 0;
+            return mv / v;
+        },
+        /** 浮盈 = (现价 - 成本) * 持仓; 算不出返回 null */
+        realPosPnl(p) {
+            const cur = this.realPosCurPrice(p);
+            const cost = Number(p && p.open_price) || 0;
+            const v = Number(p && p.volume) || 0;
+            if (cur <= 0 || cost <= 0 || v <= 0) return null;
+            return (cur - cost) * v;
+        },
+        /** 盈亏% = (现价 - 成本) / 成本; 返回小数 (0.05 = 5%), 前端 App.fmtPct 内部会 *100 */
+        realPosPnlPct(p) {
+            const cur = this.realPosCurPrice(p);
+            const cost = Number(p && p.open_price) || 0;
+            if (cur <= 0 || cost <= 0) return null;
+            return (cur - cost) / cost;
+        },
+        /** 未结委托 (可撤单) -- 用于卡片标题统计 */
+        pendingRealOrders() {
+            return (this.realAccount.orders || []).filter(o => o && o.cancelable);
+        },
+
+        /** 实盘账户总浮盈 (元) = 各持仓 realPosPnl 之和; 任意一只算不出就跳过该只
+         *  全部持仓都算不出 (eg 缺现价) -> 返回 null, 前端显示"待 miniQMT 推送现价" */
+        realPosTotalPnl() {
+            const ps = (this.realAccount.positions || []);
+            let sum = 0, valid = 0;
+            ps.forEach(p => {
+                const v = this.realPosPnl(p);
+                if (v !== null) { sum += v; valid += 1; }
+            });
+            return valid > 0 ? sum : null;
+        },
+        /** 总浮盈% = 总浮盈 / 总成本 (sum(volume*open_price))
+         *  返回小数 (0.05 = 5%), App.fmtPct 内部会 *100 -- 不要在这里再乘 */
+        realPosTotalPnlPct() {
+            const ps = (this.realAccount.positions || []);
+            let costSum = 0, pnlSum = 0, valid = 0;
+            ps.forEach(p => {
+                const cost = Number(p.open_price) || 0;
+                const vol = Number(p.volume) || 0;
+                const pnl = this.realPosPnl(p);
+                if (pnl !== null && cost > 0 && vol > 0) {
+                    costSum += cost * vol;
+                    pnlSum += pnl;
+                    valid += 1;
+                }
+            });
+            if (valid === 0 || costSum <= 0) return null;
+            return pnlSum / costSum;
+        },
+        /** 实盘持仓策略覆盖率 {bound, total}; bound = 当前持仓里在 strategy_config 里有绑的 */
+        realStratCoverage() {
+            const ps = (this.realAccount.positions || []);
+            const total = ps.length;
+            let bound = 0;
+            ps.forEach(p => { if (this.hasBinding(p.stock_code)) bound += 1; });
+            return { bound, total };
+        },
+        /** 今日已成交委托 (traded_volume > 0); 用于状态条统计 */
+        realFilledOrders() {
+            return (this.realAccount.orders || []).filter(o => Number(o && o.traded_volume) > 0);
+        },
+
+        /** 「策略信号」表的"授权状态"列文案: 用 _signal_id 和 approvals 联表
+         *  signal id = ts|code|side, approvals 由 /api/live/approvals 维护 */
+        _signalKey(s) {
+            return (s.ts || '') + '|' + (s.code || '') + '|' + (s.side || '');
+        },
+        signalApprovalText(s) {
+            const k = this._signalKey(s);
+            const hit = (this.approvals || []).find(a => a.id === k);
+            if (!hit) return '—';
+            return hit.status === 'pending'  ? '待授权'
+                 : hit.status === 'approved' ? '已下单'
+                 : hit.status === 'rejected' ? '已拒绝'
+                 : hit.status === 'expired'  ? '已过期'
+                 : hit.status;
+        },
+        signalApprovalBadgeCls(s) {
+            const k = this._signalKey(s);
+            const hit = (this.approvals || []).find(a => a.id === k);
+            if (!hit) return 'text-gray-400';
+            return hit.status === 'pending'  ? 'text-yellow-700 font-semibold'
+                 : hit.status === 'approved' ? 'text-green-700 font-semibold'
+                 : hit.status === 'rejected' ? 'text-gray-600'
+                 : 'text-gray-400';
+        },
+
+        /** 撤单: 调 /real_order/cancel, 成功后立刻刷新一次 (后端会让 cache 过期) */
+        async cancelRealOrder(o) {
+            if (!o || !o.order_id) return;
+            if (!window.confirm('确认撤销委托 #' + o.order_id + ' (' + o.stock_code + ' '
+                                + (o.side === 'buy' ? '买入' : '卖出') + ' '
+                                + o.order_volume + '股) ?')) return;
+            this.cancelBusyId = o.order_id;
+            try {
+                const r = await App.post('/api/live/real_order/cancel', { order_id: o.order_id });
+                App.toast(r.message || (r.ok ? '撤单已提交' : '撤单失败'), r.ok ? 'success' : 'danger');
+                if (r.ok) await this.refreshRealAccount(false);
+            } catch (e) {
+                App.toast('请求失败: ' + (e && e.message ? e.message : e), 'danger');
+            } finally {
+                this.cancelBusyId = 0;
+            }
+        },
+
+        /** 实盘表里某只「未绑定」的票, 点击 → 复用「添加股票」弹窗 (code 预填好) */
+        openBindFromReal(code) {
+            this.stockBind.show = true;
+            this.stockBind.code = code || '';
+            this.stockBind.strategy = '';
+            this.stockBind.source = 'real';   // 实盘绑定: 写入 per_stock 路由
+        },
+
+        /** 该 code 是否有显式策略绑定 (per_stock 里有 / 或在 watch_pool 里); 决定弹窗是否显示「解除绑定」 */
+        hasBinding(code) {
+            if (!code) return false;
+            const ps = this.strategyConfig.per_stock || {};
+            if (ps[code]) return true;
+            return (this.mergedList || []).includes(code);
+        },
+
+        /** 弹窗里点「解除绑定」: 调 /stock/unbind 移除 per_stock + watch_pool, 引擎热加载后不再出信号 */
+        async confirmUnbindStrategy() {
+            const code = (this.strategyDetailForPos.code || '').trim();
+            if (!code) return;
+            if (!window.confirm(
+                code + ' 解除绑定后, 引擎不再对它算 buy/sell 信号.\n\n确定?'
+            )) return;
+            try {
+                const r = await App.post('/api/live/stock/unbind', { code });
+                if (r && r.ok) {
+                    if (r.per_stock) this.strategyConfig.per_stock = r.per_stock;
+                    if (r.default) this.strategyConfig.default = r.default;
+                    await this.refreshMergedWatch();
+                    this.opLog = r.message || '';
+                    App.toast(r.message || (code + ' 已解绑'), 'success');
+                    this.strategyDetailForPos.show = false;
+                } else {
+                    App.toast('解绑失败: ' + ((r && r.message) || '未知错误'), 'danger');
+                }
+            } catch (e) {
+                console.error(e);
+                App.toast('请求失败: ' + (e && e.message ? e.message : String(e)), 'danger');
+            }
+        },
+
+        /** 持仓表 + 监控池里没成交的票 (volume = 0) 合并; 让用户加完即看到"已纳入交易" */
+        zeroPositionRows() {
+            // 待入场: 监控池 - 已持仓代码
+            const positionsCodes = new Set((this.state.positions || []).map(p => p.code));
+            const src = this.bindingSource || {};
+            const merged = this.mergedList || [];
+            return merged
+                .filter(c => !positionsCodes.has(c))
+                .filter(c => src[c] !== 'real')
+                .map(c => ({ code: c, _zero: true }));
+        },
+        displayPositions() {
+            // 以实际买入为准: 只展示成交持仓 (volume>0), 不再混入「待入场 0 股」行
+            return (this.state.positions || []).filter(p => p && Number(p.volume) > 0);
+        },
+
+        async applyStrategies() {
+            // 只保留合并监控列表里出现过的票, 避免历史脏数据残留
+            const codes = new Set(this.mergedList || []);
+            const cleaned = {};
+            for (const [code, name] of Object.entries(this.strategyConfig.per_stock || {})) {
+                if (codes.has(code) && name) cleaned[code] = name;
+            }
+            const payload = { default: this.strategyConfig.default, per_stock: cleaned };
+            const r = await App.post('/api/live/strategies/config', payload);
+            this.opLog = r.message;
+            App.toast(r.ok ? '策略配置已应用' : r.message, r.ok ? 'success' : 'warn');
+            if (r.ok) {
+                this.strategyConfig.per_stock = cleaned;
+            }
+        },
+
+        _todayPrefix() {
+            return new Date().toISOString().slice(0, 10);   // YYYY-MM-DD
+        },
+        // 信号: 直接按 ts 倒序, 最多展示 30 条
+        // (历史回放 + 盘中实时信号都在 state.signals 里, 不再做 today/all 切换)
+        filteredSignals() {
+            const all = (this.state.signals || []).slice();
+            all.sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
+            return all.slice(0, 30);
+        },
+        // 成交流水: 同样按 ts 倒序, 最多 20 条 (右侧紧凑展示)
+        recentOrders() {
+            const all = (this.state.orders || []).slice();
+            all.sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
+            return all.slice(0, 20);
+        },
+
+        async ctrl(field, value) {
+            const r = await App.post('/api/live/control', { field, value });
+            this.opLog = r.message;
+            App.toast(r.message, 'success');
+            await this.refresh();
+        },
+
+        async setStatus(status) {
+            const r = await App.post('/api/live/status', { status });
+            this.opLog = r.message;
+            App.toast(r.message, 'success');
+            await this.refresh();
+        },
+
+        // 龙头战法 -- 拉候选名单
+        // 数据源: auto (默认 = mysql -> xtdata -> mock 自动降级) / mysql / xtdata / mock
+        async loadDragonCandidates() {
+            this.dragon.loading = true;
+            try {
+                const params = new URLSearchParams({ source: this.dragon.sourceMode || 'auto' });
+                const r = await App.get('/api/dragon/candidates?' + params.toString());
+                this.dragon.items = (r && r.items) || [];
+                this.dragon.source = (r && r.source) || '';
+                this.dragon.tradeDate = (r && r.trade_date) || '';
+                this.dragon.warning = (r && r.warning) || '';
+                if (!this.dragon.items.length) App.toast('当前条件下无龙头候选', 'warn');
+            } catch (e) {
+                App.toast('拉龙头候选失败: ' + e, 'danger');
+            } finally {
+                this.dragon.loading = false;
+            }
+        },
+
+        // 一键把候选写入 watch_pool 并绑 dragon_picker (热加载)
+        async bindDragonAll() {
+            const codes = this.dragon.items.map((x) => x.code);
+            if (codes.length === 0) return;
+            if (!confirm('把 ' + codes.length + ' 只龙头候选加入监控并绑定 dragon_picker?')) return;
+            this.dragon.binding = true;
+            try {
+                const r = await App.post('/api/dragon/bind', { codes });
+                this.opLog = r.message || '';
+                App.toast(r.message || '完成', r.ok ? 'success' : 'danger');
+                await this.refresh();
+            } catch (e) {
+                App.toast('绑定失败: ' + e, 'danger');
+            } finally {
+                this.dragon.binding = false;
+            }
+        },
+
+        // 危险操作二次确认: action ∈ {'force_clear_all', 'HALTED'}
+        async confirmDanger(action) {
+            const labels = {
+                force_clear_all: { tip: '一键清仓: 下一轮主循环会平掉全部持仓\n\n继续吗?',
+                                   call: () => this.ctrl('force_clear_all', true) },
+                HALTED:          { tip: '强制熔断: 立刻进入 HALTED 状态, 必须人工解除\n\n继续吗?',
+                                   call: () => this.setStatus('HALTED') },
+            };
+            const item = labels[action];
+            if (!item) return;
+            if (!confirm(item.tip)) return;
+            await item.call();
+        },
+    }
+}
+</script>
+{% endblock %}
