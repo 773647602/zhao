@@ -4,10 +4,10 @@
 {% block content %}
 <div x-data="poolApp()" x-init="init()">
 
-    <div class="flex items-center justify-between mb-6">
+    <div class="mb-6">
+        <div class="flex items-center justify-between gap-3">
         <div>
             <h1 class="text-2xl font-bold text-gray-900 mb-1">选股池</h1>
-            <p class="text-sm text-gray-600">各策略独立选股，统一展示入选股票（无默认策略），结果持久化到数据库</p>
             <p class="text-xs text-gray-400 mt-1">
                 <template x-if="summary.strategies > 0">
                     <span>共 <span class="font-semibold" x-text="summary.strategies"></span> 个策略 ·
@@ -15,14 +15,55 @@
                         交易日 <span class="font-mono" x-text="trade_date || '-'"></span></span>
                 </template>
                 <template x-if="selection_run_at"> · 选股时间 <span class="font-mono" x-text="selection_run_at"></span></template>
+                <template x-if="market_volume.text">
+                    · 昨日全市场量能 <span class="font-mono text-indigo-600 font-semibold" x-text="market_volume.text"></span>
+                    <span class="text-gray-400">(<span class="font-mono" x-text="market_volume.trade_date"></span>)</span>
+                </template>
+                <template x-if="daily_ingest.trade_date">
+                    · 最新日线入库 <span class="font-mono text-gray-700 font-semibold" x-text="daily_ingest.trade_date"></span>
+                    <span class="text-gray-500">(<span class="font-mono" x-text="daily_ingest.count"></span> 只 / <span x-text="daily_ingest.pct + '%'"></span>)</span>
+                    <span x-show="!daily_ingest.complete" class="text-amber-600 font-semibold">· 未完整入库</span>
+                    <span x-show="daily_ingest.complete" class="text-green-600 font-semibold">· 已完整</span>
+                </template>
             </p>
         </div>
         <div class="flex items-center gap-3">
+            <!-- 昨日量能阈值配置 (显眼: 标题栏右上, 刷新按钮旁) -->
+            <div class="flex items-center gap-2 bg-indigo-50 border border-indigo-200 rounded-lg px-3 py-1" title="09:28 推监控池：昨日量能高于阈值→推「当日」候选；低于/等于→推「昨日」阴线候选">
+                <span class="text-xs font-semibold text-indigo-700 whitespace-nowrap">09:28 量能阈值</span>
+                <input x-model="min_market_yi" type="number" step="0.1" min="0.1"
+                       class="w-16 border border-indigo-200 rounded-md text-sm px-2 py-0.5 text-right font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+                <span class="text-xs text-indigo-500">万亿</span>
+            </div>
+            <!-- 昨日阴线涨幅下限配置 -->
+            <div class="flex items-center gap-2 bg-indigo-50 border border-indigo-200 rounded-lg px-3 py-1" title="量能不足时推「昨日」阴线候选：仅昨日涨幅高于该下限(跌幅不深)的候选才入池">
+                <span class="text-xs font-semibold text-indigo-700 whitespace-nowrap">阴线涨跌幅下限</span>
+                <input x-model="prev_drop_min_pct" type="number" step="0.5" min="-15" max="0"
+                       class="w-16 border border-indigo-200 rounded-md text-sm px-2 py-0.5 text-right font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+                <span class="text-xs text-indigo-500">%</span>
+                <button class="btn btn-primary btn-sm" @click="saveConfig()" :disabled="saving">
+                    <span x-show="!saving">保存</span>
+                    <span x-show="saving">...</span>
+                </button>
+                <span class="text-xs text-green-700 whitespace-nowrap" x-show="saveMsg" x-text="saveMsg"></span>
+            </div>
             <button class="btn btn-secondary btn-sm" @click="refresh()" :disabled="loading">
                 <span x-show="!loading">刷新</span>
                 <span x-show="loading">加载中...</span>
             </button>
         </div>
+    </div>
+
+    <!-- 09:28 推送监控池分支逻辑状态 (配置项下方) -->
+    <div class="flex items-start gap-3 mt-3 p-3 rounded-lg border border-blue-200 bg-blue-50" x-show="push_logic && push_logic.text">
+        <span class="text-xs font-semibold text-blue-700 shrink-0 mt-0.5">09:28 推送逻辑</span>
+        <div class="min-w-0">
+            <p class="text-sm text-blue-900 leading-snug">
+                <span x-text="push_logic.text"></span>
+            </p>
+            <p class="text-xs text-blue-500 mt-1 leading-snug" x-text="push_logic.tip"></p>
+        </div>
+    </div>
     </div>
 
     <!-- 汇总卡片 -->
@@ -81,8 +122,9 @@
                     <th>股票名称</th>
                     <th>入选策略</th>
                     <th>开盘涨幅</th>
-                    <th>当前涨幅</th>
-                    <th>入选时间</th>
+                    <th>收盘涨幅</th>
+                    <th class="cursor-pointer select-none" @click="toggleSort('selected_at')">入选时间<span x-show="sortKey==='selected_at'" x-text="sortDir===1?' ▲':' ▼'"></span></th>
+                    <th>市场量能（昨日）</th>
                     <th>入选理由</th>
                 </tr>
             </thead>
@@ -97,6 +139,15 @@
                         <td class="text-xs font-mono" x-html="pctHtml(r.open_pct)"></td>
                         <td class="text-xs font-mono" x-html="pctHtml(r.cur_pct)"></td>
                         <td class="text-xs text-gray-500 font-mono" x-text="r.selected_at || r.trade_date || '-'"></td>
+                        <td class="text-xs">
+                            <template x-if="r.market_volume && r.market_volume.text">
+                                <span class="font-mono text-indigo-600" x-text="r.market_volume.text"></span>
+                                <span class="text-gray-400 font-mono text-[10px]" x-text="'(' + r.market_volume.trade_date + ')'"></span>
+                            </template>
+                            <template x-if="!(r.market_volume && r.market_volume.text)">
+                                <span class="text-gray-400">-</span>
+                            </template>
+                        </td>
                         <td class="text-xs text-gray-500" x-text="r.reason || ''"></td>
                     </tr>
                 </template>
@@ -116,10 +167,24 @@ function poolApp() {
         enabledCount: 0,
         selection_run_at: '',
         trade_date: '',
+        market_volume: {},
+        daily_ingest: {},
         loading: false,
+        min_market_yi: 2.0,
+        prev_drop_min_pct: -5.0,
+        push_logic: null,
+        saveMsg: '',
+        saving: false,
+        sortKey: '_selected_at_raw',
+        sortDir: -1,
+        toggleSort(k) { if (this.sortKey === k) { this.sortDir *= -1; } else { this.sortKey = k; this.sortDir = 1; } },
+        fmtSelected(v) { if (!v) return ''; return String(v).trim().slice(0, 10); },
         filteredRows() {
-            if (!this.filterStrategy) return this.rows;
-            return this.rows.filter(r => r.strategy === this.filterStrategy);
+            let rows = this.rows;
+            if (this.filterStrategy) rows = rows.filter(r => r.strategy === this.filterStrategy);
+            const k = this.sortKey, d = this.sortDir;
+            if (k) rows = rows.slice().sort((a, b) => { const av = String(a[k] || ''), bv = String(b[k] || ''); return av < bv ? -1 * d : (av > bv ? d : 0); });
+            return rows;
         },
         pctHtml(v) {
             if (v === null || v === undefined || v === '') return '<span class="text-gray-300">-</span>';
@@ -129,10 +194,36 @@ function poolApp() {
             return `<span class="${cls}">${n > 0 ? '+' : ''}${n.toFixed(2)}%</span>`;
         },
         async init() {
-            await this.refresh();
+            await this.refresh(true);
+            await this.loadConfig();
+            // 实时涨幅: 每 5 秒按分时 tick 刷新 (收盘后 lastPrice 定格为当日收盘价)
+            setInterval(() => this.refresh(true), 5000);
         },
-        async refresh() {
-            this.loading = true;
+        async loadConfig() {
+            const d = await App.get('/api/pool/config');
+            if (d && d.min_market_yi) this.min_market_yi = d.min_market_yi;
+            if (d && d.prev_drop_min_pct !== undefined) this.prev_drop_min_pct = d.prev_drop_min_pct;
+            if (d && d.push_logic) this.push_logic = d.push_logic;
+        },
+        async saveConfig() {
+            this.saving = true;
+            this.saveMsg = '';
+            const d = await App.post('/api/pool/config', {
+                min_market_yi: Number(this.min_market_yi),
+                prev_drop_min_pct: Number(this.prev_drop_min_pct)
+            });
+            this.saving = false;
+            if (d && d.ok) {
+                if (d.min_market_yi) this.min_market_yi = d.min_market_yi;
+                if (d.prev_drop_min_pct !== undefined) this.prev_drop_min_pct = d.prev_drop_min_pct;
+                this.saveMsg = d.message || '已保存';
+            } else {
+                this.saveMsg = (d && d.message) || '保存失败';
+            }
+            setTimeout(() => { this.saveMsg = ''; }, 3000);
+        },
+        async refresh(silent) {
+            if (!silent) this.loading = true;
             const data = await App.get('/api/pool/list');
             if (data) {
                 const groups = data.groups || [];
@@ -145,10 +236,13 @@ function poolApp() {
                             strategy: g.strategy || '',
                             strategy_label: g.label || g.strategy || '',
                             trade_date: r.trade_date || g.trade_date || data.trade_date || '',
-                            selected_at: r.selected_at || '',
+                            selected_at: r.selected_at ? this.fmtSelected(r.selected_at) : this.trade_date || '',
+                            // 排序键: selected_at 缺失(today 手动/自动候选未标时间)时回退到交易日, 保证按时间先排总有值
+                            _selected_at_raw: r.selected_at || r.trade_date || '',
                             open_pct: r.open_pct,
                             cur_pct: r.cur_pct,
                             reason: r.reason || '',
+                            market_volume: r.market_volume || null,
                         });
                     });
                 });
@@ -165,6 +259,8 @@ function poolApp() {
                 this.enabledCount = groups.filter(g => g.enabled).length;
                 this.selection_run_at = data.selection_run_at || '';
                 this.trade_date = data.trade_date || '';
+                this.market_volume = data.market_volume || {};
+                this.daily_ingest = data.daily_ingest || {};
             }
             this.loading = false;
         },

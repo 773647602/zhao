@@ -28,9 +28,8 @@
                 <ul>
                     <li>技术指标 -- MACD / 均线 / RSI / BOLL / BIAS</li>
                     <li>量化选股 -- 多因子合成</li>
-                    <li>龙头动量 -- 龙头首板战法</li>
                     <li>趋势跟随 -- 海龟唐奇安通道</li>
-                    <li>震荡网格 -- 经典网格</li>
+                    <li>震荡网格 -- 超跌反弹</li>
                     <li>机器学习 -- ML 概率因子</li>
                 </ul>
             </div>
@@ -86,10 +85,17 @@
                 </div>
                 <template x-if="cfg.isFilter">
                     <div class="grid grid-cols-2 gap-3">
+                        <template x-if="cfg.name !== 'grid_classic'">
+                            <div class="col-span-2 grid grid-cols-2 gap-3">
                         <div>
                             <label class="block text-xs text-gray-600 mb-1">昨日收盘涨幅 ＜ 阈值 %</label>
                             <input type="number" step="0.1" class="w-full rounded border border-gray-300 px-2 py-1 text-sm font-mono"
                                    placeholder="留空=禁用" x-model="cfg.values.max_prev_pct">
+                        </div>
+                        <div>
+                            <label class="block text-xs text-gray-600 mb-1">昨日开盘涨幅 ＜ 阈值 %</label>
+                            <input type="number" step="0.1" class="w-full rounded border border-gray-300 px-2 py-1 text-sm font-mono"
+                                   placeholder="留空=禁用" x-model="cfg.values.max_prev_open_pct">
                         </div>
                         <div>
                             <label class="block text-xs text-gray-600 mb-1">今日开盘涨幅 ＞ 阈值 %</label>
@@ -104,9 +110,9 @@
                         <div>
                             <label class="block text-xs text-gray-600 mb-1">昨日收盘站上 N 日线</label>
                             <select class="w-full rounded border border-gray-300 px-2 py-1 text-sm font-mono" x-model="cfg.values.ma_period">
-                                <option :value="5">5日线</option>
-                                <option :value="10">10日线</option>
-                                <option :value="20">20日线</option>
+                                <option value="5">5日线</option>
+                                <option value="10">10日线</option>
+                                <option value="20">20日线</option>
                                 <option value="">禁用</option>
                             </select>
                         </div>
@@ -115,13 +121,37 @@
                             <input type="number" step="0.1" class="w-full rounded border border-gray-300 px-2 py-1 text-sm font-mono"
                                    placeholder="留空=禁用" x-model="cfg.values.max_index_pct">
                         </div>
-                        <div class="flex items-center text-xs text-gray-400 col-span-2">留空表示该条件禁用<br>指数开盘涨幅高于阈值% 则整策略不选票</div>
+                        <div>
+                            <label class="block text-xs text-gray-600 mb-1">昨日全市场上涨家数 ＞ xxx 家则不选股</label>
+                            <input type="number" step="10" class="w-full rounded border border-gray-300 px-2 py-1 text-sm font-mono"
+                                   placeholder="留空=禁用" x-model="cfg.values.max_prev_up_count">
+                        </div>
+                            </div>
+                        </template>
+                        <template x-if="cfg.name === 'grid_classic'">
+                        <div>
+                            <label class="block text-xs text-gray-600 mb-1">昨日全市场量能 ＜ xxx 万亿则不选票</label>
+                            <input type="number" min="0" step="0.1" class="w-full rounded border border-gray-300 px-2 py-1 text-sm font-mono"
+                                   placeholder="留空=禁用" x-model="cfg.values.min_prev_market_amount">
+                        </div>
+                        </template>
+                        <div class="col-span-2 grid grid-cols-2 gap-3">
+                            <label class="flex items-center gap-2 text-xs text-gray-600 cursor-pointer">
+                                <input type="checkbox" class="w-4 h-4" x-model="cfg.values.exclude_chinext">
+                                排除创业板（300/301 开头）
+                            </label>
+                            <label class="flex items-center gap-2 text-xs text-gray-600 cursor-pointer">
+                                <input type="checkbox" class="w-4 h-4" x-model="cfg.values.exclude_star">
+                                排除科创板（688 开头）
+                            </label>
+                        </div>
+                        <div x-show="cfg.name !== 'grid_classic'" class="flex items-center text-xs text-gray-400 col-span-2">留空表示该条件禁用<br>指数开盘涨幅高于阈值% 则整策略不选票</div>
                     </div>
                 </template>
                 <!-- 买卖条件: 用 x-show 常驻 DOM (避免 <template x-if> 多根只渲染首元素的限制) -->
                 <div x-show="cfg.isFilter" class="mt-4 pt-3 border-t border-gray-200">
                         <div class="flex items-center justify-between mb-2">
-                            <div class="text-sm font-semibold text-gray-700">买卖条件</div>
+                            <div class="text-sm font-semibold text-gray-700">买入条件</div>
                             <label class="flex items-center gap-1.5 text-xs text-gray-600 cursor-pointer">
                                 <input type="checkbox" class="w-4 h-4" x-model="cfg.values.trade_enabled">
                                 启用自动买卖（关闭 = 仅选股不交易）
@@ -129,7 +159,7 @@
                         </div>
                         <div class="grid grid-cols-2 gap-3">
                             <div>
-                                <label class="block text-xs text-gray-600 mb-1">买入：买入规则</label>
+                                <label class="block text-xs text-gray-600 mb-1">买入规则</label>
                                 <select class="w-full rounded border border-gray-300 px-2 py-1 text-sm"
                                         x-model="cfg.values.buy_mode">
                                     <option value="open">开盘买</option>
@@ -138,14 +168,19 @@
                                 </select>
                             </div>
                             <div>
-                                <label class="block text-xs text-gray-600 mb-1">买入：当日开盘涨幅 ≥ 阈值 %</label>
+                                <label class="block text-xs text-gray-600 mb-1">当日开盘涨幅 ≥ 阈值 %</label>
                                 <input type="number" step="0.1" class="w-full rounded border border-gray-300 px-2 py-1 text-sm font-mono"
                                        placeholder="留空=不限" x-model="cfg.values.buy_open_pct_min">
                             </div>
                             <div>
-                                <label class="block text-xs text-gray-600 mb-1">买入：当日开盘涨幅 ≤ 阈值 %（高开上限）</label>
+                                <label class="block text-xs text-gray-600 mb-1">当日开盘涨幅 ≤ 阈值 %（高开上限）</label>
                                 <input type="number" step="0.1" class="w-full rounded border border-gray-300 px-2 py-1 text-sm font-mono"
                                        placeholder="留空=不限" x-model="cfg.values.buy_open_pct_max">
+                            </div>
+                            <div class="col-span-2">
+                                <label class="block text-xs text-gray-600 mb-1">开盘向上超阈值 % 则不买入（0=现价高于开盘价即不买）</label>
+                                <input type="number" step="0.1" class="w-full rounded border border-gray-300 px-2 py-1 text-sm font-mono"
+                                       placeholder="留空=禁用" x-model="cfg.values.buy_no_buy_up_pct">
                             </div>
                             <template x-if="cfg.values.buy_mode === 'dip_recover'">
                                 <div>
@@ -175,19 +210,48 @@
                                            placeholder="如 0.5 表示自最低回升0.5%" x-model="cfg.values.buy_rebound_pct">
                                 </div>
                             </template>
+                        </div>
+                        <div class="text-sm font-semibold text-gray-700 mt-3 mb-2">买入仓位管理</div>
+                        <div class="grid grid-cols-2 gap-3">
                             <div>
-                                <label class="block text-xs text-gray-600 mb-1">卖出：浮盈 ≥ 阈值 % 止盈</label>
+                                <label class="flex items-center gap-1.5 text-xs text-gray-600 mb-1">
+                                    <input type="checkbox" class="w-4 h-4" x-model="cfg.values.buy_qty_enabled">
+                                    启用买入股数（固定数量）
+                                </label>
+                                <input type="number" step="100" min="100" class="w-full rounded border border-gray-300 px-2 py-1 text-sm font-mono"
+                                       placeholder="如 1000 表示每只买 1000 股" x-model="cfg.values.buy_qty"
+                                       :disabled="!cfg.values.buy_qty_enabled">
+                            </div>
+                            <div>
+                                <label class="flex items-center gap-1.5 text-xs text-gray-600 mb-1">
+                                    <input type="checkbox" class="w-4 h-4" x-model="cfg.values.buy_max_enabled">
+                                    启用买入金额（单只占总资金 %）
+                                </label>
+                                <input type="number" step="0.1" min="0" class="w-full rounded border border-gray-300 px-2 py-1 text-sm font-mono"
+                                       placeholder="如 20 表示单只最多占总资金 20%" x-model="cfg.values.buy_max_percent"
+                                       :disabled="!cfg.values.buy_max_enabled">
+                            </div>
+                            <div>
+                                <label class="block text-xs text-gray-600 mb-1">当日最多买入 _ 只（基于涨幅从高到低取）</label>
+                                <input type="number" step="1" min="0" class="w-full rounded border border-gray-300 px-2 py-1 text-sm font-mono"
+                                       placeholder="如 5 表示当日最多买 5 只" x-model="cfg.values.buy_max_daily">
+                            </div>
+                        </div>
+                        <div class="text-sm font-semibold text-gray-700 mt-3 mb-2">卖出条件</div>
+                        <div class="grid grid-cols-2 gap-3">
+                            <div>
+                                <label class="block text-xs text-gray-600 mb-1">浮盈 ≥ 阈值 % 止盈</label>
                                 <input type="number" step="0.1" class="w-full rounded border border-gray-300 px-2 py-1 text-sm font-mono"
                                        placeholder="留空=禁用" x-model="cfg.values.take_profit_pct">
                             </div>
                             <div>
-                                <label class="block text-xs text-gray-600 mb-1">卖出：浮亏 ≤ 阈值 % 止损（负值）</label>
+                                <label class="block text-xs text-gray-600 mb-1">浮亏 ≤ 阈值 % 止损（负值）</label>
                                 <input type="number" step="0.1" class="w-full rounded border border-gray-300 px-2 py-1 text-sm font-mono"
                                        placeholder="如 -3 表示亏 3% 卖出" x-model="cfg.values.stop_loss_pct">
                             </div>
                         </div>
                         <div class="text-xs text-gray-400 mt-2">
-                            止盈/止损以持仓成本价为基准（浮盈率 = 现价÷成本−1）；当日 09:26 选股入池后，09:29-09:35 开盘买入窗口内即评估买入。买入规则三选一：“开盘买”按开盘涨幅判断；“下杀后上钩买”以开盘价为基准（最低较开盘跌够阈值后，现价回升够阈值）；“下杀后回钩买(跟踪新低)”以盘中最低点为基准（现价跌破开盘价阈值确认下杀后，自盘中最低点回升够阈值即买）。
+                            止盈/止损以持仓成本价为基准（浮盈率 = 现价÷成本−1）；当日 09:27 选股入池后，09:00:02-09:39:00 开盘买入窗口内每 30 秒评估买入（scheduler 09:00 自动启动窗口任务，到 09:39 自动停止）。买入规则三选一：“开盘买”按开盘涨幅判断；“下杀后上钩买”以开盘价为基准（最低较开盘跌够阈值后，现价回升够阈值）；“下杀后回钩买(跟踪新低)”以盘中最低点为基准（现价跌破开盘价阈值确认下杀后，自盘中最低点回升够阈值即买）。
                         </div>
                     </div>
                 <template x-if="!cfg.isFilter">
@@ -424,7 +488,8 @@ function strategyApp() {
             };
         },
         openConfig(s) {
-            const isF = s.name === 'weak_to_strong';
+            // 「选股条件/买入条件/买入仓位管理/卖出条件」四区块可用策略: weak_to_strong + grid_classic (字段完全复用弱转强)
+            const isF = s.name === 'weak_to_strong' || s.name === 'grid_classic';
             let params = [], values = {}, initValues = {};
             if (isF) {
                 const inst = this._instance(s.name);
@@ -440,10 +505,13 @@ function strategyApp() {
         },
         _weakEditable(f, t) {
             const out = {};
-            ['max_prev_pct', 'min_open_pct', 'min_vol_grow_pct', 'max_index_pct'].forEach(k => {
+            ['max_prev_pct', 'max_prev_open_pct', 'min_open_pct', 'min_vol_grow_pct', 'max_index_pct', 'max_prev_up_count'].forEach(k => {
                 out[k] = (f[k] !== null && f[k] !== undefined) ? f[k] : '';
             });
-            out.ma_period = (f.ma_period !== null && f.ma_period !== undefined) ? f.ma_period : '';
+            out.min_prev_market_amount = (f.min_prev_market_amount !== null && f.min_prev_market_amount !== undefined) ? f.min_prev_market_amount : '';
+            out.ma_period = (f.ma_period !== null && f.ma_period !== undefined) ? String(f.ma_period) : '';
+            out.exclude_chinext = !!(f.exclude_chinext);
+            out.exclude_star = !!(f.exclude_star);
             t = t || {};
             out.trade_enabled = !!t.enabled;
             const b = t.buy || {};
@@ -454,6 +522,12 @@ function strategyApp() {
             out.buy_recover_pct = (b.recover_pct !== null && b.recover_pct !== undefined) ? b.recover_pct : 0.5;
             out.buy_plunge_pct = (b.plunge_pct !== null && b.plunge_pct !== undefined) ? b.plunge_pct : 2.0;
             out.buy_rebound_pct = (b.rebound_pct !== null && b.rebound_pct !== undefined) ? b.rebound_pct : 0.5;
+            out.buy_no_buy_up_pct = (b.no_buy_up_pct !== null && b.no_buy_up_pct !== undefined) ? b.no_buy_up_pct : '';
+            out.buy_max_percent = (b.max_percent !== null && b.max_percent !== undefined) ? b.max_percent : '';
+            out.buy_max_daily = (b.max_daily !== null && b.max_daily !== undefined) ? b.max_daily : '';
+            out.buy_qty_enabled = !!(b.qty_enabled);
+            out.buy_qty = (b.qty !== null && b.qty !== undefined) ? b.qty : 100;
+            out.buy_max_enabled = !!(b.max_enabled);
             const s = t.sell || {};
             out.take_profit_pct = (s.take_profit_pct !== null && s.take_profit_pct !== undefined) ? s.take_profit_pct : '';
             out.stop_loss_pct = (s.stop_loss_pct !== null && s.stop_loss_pct !== undefined) ? s.stop_loss_pct : '';
@@ -467,9 +541,16 @@ function strategyApp() {
             let r;
             if (this.cfg.isFilter) {
                 const filters = {};
-                ['max_prev_pct', 'min_open_pct', 'min_vol_grow_pct', 'ma_period', 'max_index_pct'].forEach(k => {
-                    filters[k] = this._numOrNull(this.cfg.values[k]);
-                });
+                if (this.cfg.name !== 'grid_classic') {
+                    ['max_prev_pct', 'max_prev_open_pct', 'min_open_pct', 'min_vol_grow_pct', 'ma_period', 'max_index_pct', 'max_prev_up_count'].forEach(k => {
+                        filters[k] = this._numOrNull(this.cfg.values[k]);
+                    });
+                }
+                if (this.cfg.name === 'grid_classic') {
+                    filters.min_prev_market_amount = this._numOrNull(this.cfg.values.min_prev_market_amount);
+                }
+                filters.exclude_chinext = !!this.cfg.values.exclude_chinext;
+                filters.exclude_star = !!this.cfg.values.exclude_star;
                 const trade = {
                     enabled: !!this.cfg.values.trade_enabled,
                     buy: {
@@ -480,13 +561,19 @@ function strategyApp() {
                         recover_pct: this._numOrNull(this.cfg.values.buy_recover_pct),
                         plunge_pct: this._numOrNull(this.cfg.values.buy_plunge_pct),
                         rebound_pct: this._numOrNull(this.cfg.values.buy_rebound_pct),
+                        no_buy_up_pct: this._numOrNull(this.cfg.values.buy_no_buy_up_pct),
+                        max_percent: this._numOrNull(this.cfg.values.buy_max_percent),
+                        max_daily: this._numOrNull(this.cfg.values.buy_max_daily),
+                        qty_enabled: !!this.cfg.values.buy_qty_enabled,
+                        qty: this._numOrNull(this.cfg.values.buy_qty),
+                        max_enabled: !!this.cfg.values.buy_max_enabled,
                     },
                     sell: {
                         take_profit_pct: this._numOrNull(this.cfg.values.take_profit_pct),
                         stop_loss_pct: this._numOrNull(this.cfg.values.stop_loss_pct),
                     },
                 };
-                r = await App.post('/api/strategy/weaktest/config', { filters, trade });
+                r = await App.post('/api/strategy/weaktest/config', { name: this.cfg.name, filters, trade });
             } else {
                 r = await App.post('/api/strategy/params', {
                     strategy: this.cfg.name, values: this.cfg.values,
@@ -494,7 +581,7 @@ function strategyApp() {
             }
             this.cfg.saving = false;
             if (r && r.ok) {
-                App.toast(this.cfg.isFilter ? '弱转强筛选与买卖条件已保存' : '参数已保存并生效', 'success');
+                App.toast(this.cfg.isFilter ? (this.cfg.label + ' 筛选与买卖条件已保存') : '参数已保存并生效', 'success');
                 const data = await App.get('/api/strategy/list');
                 if (data) {
                     this.strategies = data.flat || [];

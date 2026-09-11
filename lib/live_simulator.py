@@ -3,10 +3,9 @@
 """
 设计:
     - 启动: 后台 daemon 线程跑 LiveTradingLoop.run_once() 循环 (默认每 60 秒)
-    - 持仓: 从 config/mock_positions.yaml 读取
-    - 模式: dry_run (默认, 模拟下单) / 实盘 (连真实 miniQMT, 慎用!)
-    - 策略: 从 config/strategies.yaml 读路由表, 注入 StrategyRouter 到 loop
-    - 行情: xtdata 真实数据
+    - 持仓: 从券商真实持仓同步 (以实际成交为准)
+    - 职责: 主循环只做数据同步 (持仓/盈亏/心跳/熔断), 不再买卖
+             买入 = 开盘买入窗口任务 (open_buy_window.py), 卖出 = 持仓页手动卖出
 
 数据写到 outputs/live_state.json, dashboard 5 秒轮询自动刷新
 """
@@ -17,7 +16,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 
 CONFIG_FILE = Path(__file__).resolve().parent.parent / "config" / "mock_positions.yaml"
@@ -32,17 +31,17 @@ WATCH_POOL_FILE = Path(__file__).resolve().parent.parent / "config" / "watch_poo
 def load_strategy_config() -> dict:
     """读 config/strategies.yaml -- 返回 {default, per_stock}"""
     if not STRATEGY_CONFIG_FILE.exists():
-        return {"default": "macd_5min", "per_stock": {}}
+        return {"default": "grid_classic", "per_stock": {}}
     try:
         import yaml
         cfg = yaml.safe_load(STRATEGY_CONFIG_FILE.read_text(encoding="utf-8")) or {}
         return {
-            "default":   cfg.get("default", "macd_5min"),
+            "default":   cfg.get("default", "grid_classic"),
             "per_stock": cfg.get("per_stock", {}) or {},
         }
     except Exception as e:
         print(f"[WARN] 读 strategies.yaml 失败: {e}")
-        return {"default": "macd_5min", "per_stock": {}}
+        return {"default": "grid_classic", "per_stock": {}}
 
 
 def save_strategy_config(default: str, per_stock: dict) -> None:
@@ -53,7 +52,7 @@ def save_strategy_config(default: str, per_stock: dict) -> None:
         header = (
             "# 实盘监控 -- 策略路由表 (由 /live 页面写入)\n"
             "# 修改后, 在页面点 '应用策略配置' 即可热加载, 无需重启\n"
-            "# MACD: macd_5min=5分钟K(日内) / macd_1d=日K(12/26/9); 另有 dual_ma_5min / ma20_hold / multi_factor_top / dragon_picker / grid_classic\n\n"
+            "# 策略路由表: 可用策略见「策略库」; default 为默认策略 (grid_classic/weak_to_strong/multi_factor_top 等)\n\n"
         )
         body = yaml.safe_dump(
             {"default": default, "per_stock": dict(per_stock or {})},
@@ -92,21 +91,33 @@ def _per_stock_to_selection_cfg(per_stock: dict) -> dict:
 # ============================================================
 
 def load_watch_pool() -> dict:
-    """读 config/watch_pool.yaml -- 返回 {codes: [str,...]}"""
+    """读 config/watch_pool.yaml -- 返回 {codes: [str,...], bindings: {code: strategy}}"""
     if not WATCH_POOL_FILE.exists():
-        return {"codes": []}
+        return {"codes": [], "bindings": {}}
     try:
         import yaml
         data = yaml.safe_load(WATCH_POOL_FILE.read_text(encoding="utf-8")) or {}
         codes = data.get("codes", []) or []
-        return {"codes": [str(c).strip() for c in codes if str(c).strip()]}
+        codes = [str(c).strip() for c in codes if str(c).strip()]
+        raw_bind = data.get("bindings") or {}
+        bindings = {}
+        for c in codes:
+            s = str(raw_bind.get(c) or "").strip()
+            if s:
+                bindings[c] = s
+        return {"codes": codes, "bindings": bindings}
     except Exception as e:
         print(f"[WARN] 读 watch_pool.yaml 失败: {e}")
-        return {"codes": []}
+        return {"codes": [], "bindings": {}}
 
 
-def save_watch_pool(codes: List[str]) -> None:
-    """写 config/watch_pool.yaml"""
+def save_watch_pool(codes: Optional[List[str]] = None,
+                    bindings: Optional[Dict[str, str]] = None) -> None:
+    """写 config/watch_pool.yaml (codes: 列表; bindings: code -> 绑定策略).
+
+    缺省 bindings=None 时保留当前文件里仍在 codes 中的既有绑定;
+    传入 bindings 时, 用其中给定的 code->策略 覆盖/新增该 code 的绑定 (不影响其它 codes 的既有绑定)。
+    """
     import yaml
     try:
         WATCH_POOL_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -114,8 +125,19 @@ def save_watch_pool(codes: List[str]) -> None:
             "# 监控代码列表 -- 与 mock 持仓、per_stock 合并为最终监控列表 (去重)\n"
             "# 也可通过页面「添加股票并绑定策略」写入\n\n"
         )
+        codes = [c.strip() for c in (codes or []) if str(c).strip()]
+        try:
+            existing = load_watch_pool().get("bindings") or {}
+        except Exception:
+            existing = {}
+        merged = {}
+        for c in codes:
+            if bindings and str(bindings.get(c) or "").strip():
+                merged[c] = str(bindings[c]).strip()
+            elif existing.get(c):
+                merged[c] = existing[c]
         body = yaml.safe_dump(
-            {"codes": [c.strip() for c in (codes or []) if str(c).strip()]},
+            {"codes": codes, "bindings": merged},
             allow_unicode=True, sort_keys=False, default_flow_style=False,
         )
         WATCH_POOL_FILE.write_text(header + body, encoding="utf-8")
@@ -308,7 +330,7 @@ def seed_historical_orders(force: bool = False) -> str:
 
     strat_cfg = load_strategy_config()
     per_stock = strat_cfg.get("per_stock") or {}
-    default_strat = strat_cfg.get("default", "macd_1d")
+    default_strat = strat_cfg.get("default", "grid_classic")
 
     start_date = os.environ.get("SIM_HISTORY_START_DATE", "2026-04-01")
     from datetime import date
@@ -526,11 +548,11 @@ class LiveSimRunner:
                                          name="LiveSimRunner")
         self._thread.start()
 
-        mode_str = "模拟模式 (dry-run, 不连券商)" if dry_run else "实盘模式 (真实下单!)"
+        mode_str = "模拟模式 (dry-run, 不连券商)" if dry_run else "实盘模式"
         return (f"[OK] 已启动 -- {mode_str}\n"
                 f"     合并后监控 {len(watch_stocks)} 只: {watch_stocks}, 周期={cycle_seconds}s, "
                 f"初始持仓 {len(s.get('positions', []))} 只, 总资金 {capital:,.0f}\n"
-                f"     实盘按策略独立评估 (每策略自己的选股池+持仓, 无默认策略)\n"
+                f"     主循环只同步持仓/盈亏/心跳, 不买卖 (买入=开盘窗口任务, 卖出=持仓页手动)\n"
                 f"     dashboard 每 5 秒自动刷新")
 
     # ------------------------------------------------------------------
@@ -556,9 +578,9 @@ class LiveSimRunner:
             }
 
         实现说明:
-            - 调 loop.run_once() 走完整流程 (含风控/下单), 信号写进 state.signals 表
-            - 同时单独再跑一遍 router 收集每只股票的方向 (buy/sell/hold), 含 hold 也返回
-              这样用户能直观看到「为什么没有信号 == 6 只全 hold」
+            - 调 loop.run_once() 走一轮数据同步 (主循环已不再买卖, run_once 只同步持仓/盈亏)
+            - 同时单独跑一遍各策略 evaluator 收集每只股票的方向 (buy/sell/hold, 仅诊断不下单)
+              这样用户能直观看到「为什么没有信号 == 全 hold」
             - 必须先 start() 过, 否则 self._loop 还没创建
         """
         if self._loop is None:
@@ -776,7 +798,7 @@ class LiveSimRunner:
         all_sigs: List[dict] = []
         for code in watch_stocks:
             strat = (self._router.per_stock.get(code) if self._router else None) \
-                    or (self._router.default if self._router else "macd_1d")
+                    or (self._router.default if self._router else "grid_classic")
             try:
                 r = run_backtest(stock_code=code, strategy_name=strat,
                                  start_date=start_date, end_date=end_date)

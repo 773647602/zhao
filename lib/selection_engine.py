@@ -171,12 +171,14 @@ class UniverseSnapshot:
     def __init__(self, meta: pd.DataFrame, latest_date: str,
                  index_open_pct: Optional[float] = None,
                  index_pct: Optional[float] = None,
-                 index_above_ma: Optional[Dict[int, bool]] = None):
+                 index_above_ma: Optional[Dict[int, bool]] = None,
+                 index_prev_amount: Optional[float] = None):
         self.meta = meta
         self.latest_date = latest_date
         self.index_open_pct = index_open_pct  # 大盘(上证综指)当日开盘涨跌幅(%)
         self.index_pct = index_pct            # 大盘(上证综指)当日涨跌幅(%), 无数据为 None
         self.index_above_ma = index_above_ma or {}  # {period: 当日收盘是否站上N日线}
+        self.index_prev_amount = index_prev_amount  # 昨日全市场(沪深两市)成交额(元)
 
     def codes(self) -> List[str]:
         return list(self.meta.index)
@@ -195,9 +197,24 @@ class UniverseSnapshot:
             if imp not in (None, "", 0):
                 if not (self.index_above_ma or {}).get(int(imp)):
                     return df.iloc[0:0]
+            # 情绪全局闸门: 昨日全市场"上涨家数"(昨收涨幅>0) > 阈值 则不选票(普涨过热); null=禁用
+            mup = f.get("max_prev_up_count")
+            if mup not in (None, "", 0) and "prev_pct" in df:
+                _up = int((df["prev_pct"] > 0).sum())
+                if _up > float(mup):
+                    return df.iloc[0:0]
+            # 量能全局闸门: 昨日全市场量能(沪深两市成交额) 低于 阈值万亿 则不选票(地量); null=禁用
+            mm = f.get("min_prev_market_amount")
+            if mm is not None and float(mm) > 0:
+                _amt = self.index_prev_amount  # 昨日两市成交额(元)
+                if _amt is None or _amt < float(mm) * 1e12:
+                    return df.iloc[0:0]
             # 弱转强1: 昨日收盘涨幅 < 阈值% (昨日弱/收弱); null=禁用
             if f.get("max_prev_pct") is not None and "prev_pct" in df:
                 df = df[df["prev_pct"] < float(f["max_prev_pct"])]
+            # 弱转强2: 昨日开盘涨幅 < 阈值% (昨日开得不高/不虚高); null=禁用
+            if f.get("max_prev_open_pct") is not None and "prev_open_pct" in df:
+                df = df[df["prev_open_pct"] < float(f["max_prev_open_pct"])]
             # 弱转强2: 今日开盘涨幅 > 阈值% (今日转强/高开); null=禁用
             if f.get("min_open_pct") is not None and "open_pct" in df:
                 df = df[df["open_pct"] > float(f["min_open_pct"])]
@@ -229,6 +246,12 @@ class UniverseSnapshot:
                 df = df[df["market_cap"] <= float(f["max_market_cap"])]
             if f.get("min_vol_ratio") is not None and "vol_ratio" in df:
                 df = df[df["vol_ratio"] >= float(f["min_vol_ratio"])]
+            # 板块排除: exclude_chinext=排除创业板(300/301开头 .SZ), exclude_star=排除科创板(688开头 .SH);
+            # 空/False/null=不禁用 (保持可开关). index 为带后缀代码, 如 300750.SZ.
+            if f.get("exclude_chinext") not in (None, "", False):
+                df = df[~df.index.map(lambda c: str(c).split(".")[0]).str.startswith(("300", "301"))]
+            if f.get("exclude_star") not in (None, "", False):
+                df = df[~df.index.map(lambda c: str(c).split(".")[0]).str.startswith("688")]
             excl = f.get("excluded_codes") or []
             if excl:
                 df = df[~df.index.isin([str(c).strip() for c in excl if str(c).strip()])]
@@ -364,6 +387,22 @@ def _index_above_ma_map(day: Optional[str]) -> Dict[int, bool]:
     return {p: bool(_cached_index_above_ma(day, p)) for p in (5, 10, 20)}
 
 
+@lru_cache(maxsize=64)
+def _cached_index_prev_amount(date_str: Optional[str]) -> Optional[float]:
+    """昨日全市场量能: trade_market_volume 中该交易日的沪深两市成交总额(元). 缺失/异常返回 None."""
+    if not date_str:
+        return None
+    try:
+        from lib.market_metrics import query_market_volume
+        rows = query_market_volume(date_str)
+        if rows:
+            tot = rows[0].get("total_amount") or 0
+            return float(tot) if tot > 0 else None
+    except Exception as e:
+        print(f"[WARN] 昨日全市场量能获取失败({date_str}): {e}", flush=True)
+    return None
+
+
 def build_universe_snapshot(lookback_days: int = _LONGEST_LOOKBACK,
                             asof_date: Optional[str] = None) -> UniverseSnapshot:
     """构建全市场快照: 每股一行, 以"asof_date 当日"为今日(>该日数据被截断)、前一根为昨日、再前为前日。
@@ -388,6 +427,10 @@ def build_universe_snapshot(lookback_days: int = _LONGEST_LOOKBACK,
                             index_above_ma=_index_above_ma_map(asof_date))
 
     latest_date = panel["trade_date"].max().strftime("%Y-%m-%d")
+    # 昨日全市场量能: 用面板倒数第二个交易日作为"昨日"查询两市成交额
+    _panel_dates = sorted(panel["trade_date"].unique())
+    _prev_td = _panel_dates[-2].strftime("%Y-%m-%d") if len(_panel_dates) >= 2 else None
+    _prev_amount = _cached_index_prev_amount(_prev_td) if _prev_td else None
     # 每股一个分组: 算最新价、当日涨跌幅、量比(最新量/20日均量)、成交额
     recs = []
     for code, g in panel.groupby("stock_code"):
@@ -419,6 +462,9 @@ def build_universe_snapshot(lookback_days: int = _LONGEST_LOOKBACK,
         # 昨日收盘涨幅% (昨收/前收-1)
         prev_pct = (prev_close / prev2_close - 1.0) * 100.0 \
             if (prev_close is not None and prev2_close and prev2_close > 0) else None
+        # 昨日开盘涨幅% (昨开/前收-1) -- 昨开得不高(不虚高) 才入池
+        prev_open_pct = (prev_open / prev2_close - 1.0) * 100.0 \
+            if (prev_open is not None and prev2_close and prev2_close > 0) else None
         close_ser = g["close"].dropna()
         ma5_prev = float(close_ser.iloc[-6:-1].mean()) if len(close_ser) >= 6 else None
         ma10_prev = float(close_ser.iloc[-11:-1].mean()) if len(close_ser) >= 11 else None
@@ -445,6 +491,7 @@ def build_universe_snapshot(lookback_days: int = _LONGEST_LOOKBACK,
             # 弱转强相关列 (数据不足为 None -> 对应过滤自动跳过)
             "open_pct": open_pct,
             "prev_pct": prev_pct,
+            "prev_open_pct": prev_open_pct,
             "vol_grow_pct": vol_grow_pct,
             "ma5_prev": ma5_prev,
             "ma10_prev": ma10_prev,
@@ -461,7 +508,8 @@ def build_universe_snapshot(lookback_days: int = _LONGEST_LOOKBACK,
     return UniverseSnapshot(meta, latest_date,
                             index_open_pct=_cached_index_open_pct(asof_date),
                             index_pct=_cached_index_pct(asof_date),
-                            index_above_ma=_index_above_ma_map(asof_date))
+                            index_above_ma=_index_above_ma_map(asof_date),
+                            index_prev_amount=_prev_amount)
 
 
 def _stock_name_map() -> Dict[str, str]:
@@ -507,12 +555,18 @@ def run_strategy_selection(inst: Dict[str, Any], snapshot: UniverseSnapshot,
             except Exception:
                 return ""
         parts: List[str] = []
+        # 弱转强: 按用户要求, 入选理由仅保留 昨收/昨开/今开 三项
+        _weak = (name == "weak_to_strong")
         # 百分比类条件: (filter键, 显示名, 指标列, 日期列)
         for k, dis, col, dcol in (
             ("max_prev_pct", "昨收涨幅", "prev_pct", "prev_date"),
+            ("max_prev_open_pct", "昨日开盘涨幅", "prev_open_pct", "prev_date"),
             ("min_open_pct", "今日开盘涨幅", "open_pct", "date"),
             ("min_vol_grow_pct", "昨量较前日", "vol_grow_pct", "prev2_date"),
         ):
+            # 弱转强不做"昨量较前日"理由
+            if _weak and k == "min_vol_grow_pct":
+                continue
             if k not in filters or filters.get(k) is None:
                 continue
             v = r.get(col)
@@ -524,20 +578,20 @@ def run_strategy_selection(inst: Dict[str, Any], snapshot: UniverseSnapshot,
             parts.append(f"{dis}({d}){float(v):.2f}%" if d else f"{dis}{float(v):.2f}%")
         # 均线周期: 站上 N 日线
         period = filters.get("ma_period")
-        if period not in (None, "", 0):
+        if not _weak and period not in (None, "", 0):
             col = f"above_ma{int(period)}"
             v = r.get(col)
             if not pd.isna(v):
                 parts.append(f"站上{int(period)}日线" if int(v) else f"未站上{int(period)}日线")
         # 大盘指数闸门 (上证指数当日开盘涨幅)
-        if filters.get("max_index_pct") not in (None, ""):
+        if not _weak and filters.get("max_index_pct") not in (None, ""):
             ip = snapshot.index_open_pct
             if ip is not None:
                 d = _d("date")
                 parts.append(f"上证开盘涨幅({d}){ip:+.2f}%" if d else f"上证开盘涨幅{ip:+.2f}%")
         # 大盘指数昨日收盘站上 N 日线
         imp = filters.get("index_ma_period")
-        if imp not in (None, "", 0):
+        if not _weak and imp not in (None, "", 0):
             flag = (snapshot.index_above_ma or {}).get(int(imp))
             if flag is not None:
                 parts.append(f"昨日大盘站上{int(imp)}日线" if flag else f"昨日大盘未站上{int(imp)}日线")

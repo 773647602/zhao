@@ -111,7 +111,7 @@ python alerting\alert_router.py     # 模拟 8 条不同级别事件
 
 ### dragon_strategy/
 
-龙头筛选（v1/v2）与 MySQL 回测辅助；`/api/dragon/candidates` 使用其中逻辑。完整独立演练与更多脚本见仓库内 **`CASE-龙头战法/`**（可复制，非运行本工作台必需）。
+龙头筛选（v1/v2）与 MySQL 回测辅助（原 `/api/dragon/*` 路由已下线）。完整独立演练与更多脚本见仓库内 **`CASE-龙头战法/`**（可复制，非运行本工作台必需）。
 
 ### morning_brief/
 

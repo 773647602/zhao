@@ -11,7 +11,7 @@ GET  /api/live/watch_merge           -- 合并后的监控列表 (?ui= 额外逗
 GET  /api/live/watch_pool            -- 读监控代码列表 (watch_pool.yaml)
 POST /api/live/watch_pool            -- 写监控代码列表
 GET  /api/live/daily_watch           -- 当日选股池 + 是否已买入 + 名称映射
-GET  /api/live/open_buy_window       -- 开盘买入窗口(09:29-09:35)任务进度
+GET  /api/live/open_buy_window       -- 开盘买入窗口(09:00:02-09:39:00)任务进度
 POST /api/live/stock/bind            -- 添加代码 + 绑定策略 (写 watch_pool + strategies.yaml 并热加载)
 """
 
@@ -41,6 +41,35 @@ from lib.strategy_registry import list_groups, list_strategies
 from lib.strategy_runner import load_selection_config
 
 router = APIRouter()
+
+# 监控最低价: 开盘买入窗口(09:00:02-09:39:00)时间段内 1m K 的 low 最小值
+# 现场重算用 (当日窗口任务未落盘 day_low 时的兜底), 进程级复用单例
+_MDP_WIN: "Any" = None
+
+def _window_day_low(code: str) -> Optional[float]:
+    """现场计算开盘买入窗口时间段内的最低价 (fallback; 拉不到返回 None)"""
+    global _MDP_WIN
+    try:
+        from live_trading.open_buy_window import WINDOW_START, WINDOW_END
+        from datetime import time as _dtime
+        import pandas as pd
+        if _MDP_WIN is None:
+            from live_trading.live_loop import MarketDataProvider
+            _MDP_WIN = MarketDataProvider()
+        df = _MDP_WIN.get_recent_kline(code, "1m", 300)
+        if df is None or len(df) < 1:
+            return None
+        idx = pd.to_datetime(df.index)
+        today0 = pd.Timestamp.now().normalize()
+        s_lo = _dtime(*WINDOW_START)
+        e_lo = _dtime(*WINDOW_END)
+        t = idx.time
+        mask = (idx >= today0) & (t >= s_lo) & (t <= e_lo)
+        if mask.any():
+            return round(float(df.loc[mask, "low"].min()), 3)
+    except Exception:
+        pass
+    return None
 _SIM = LiveSimRunner()
 
 
@@ -82,6 +111,87 @@ def _save_state(state: dict):
 @router.get("/state")
 def get_state():
     return _load_state()
+
+
+@router.get("/buy_records")
+def buy_records():
+    """买入记录: 当日开盘买入窗口执行过的所有股票(已买+未买) + 数据库实际买入成交.
+
+    - 已买行: 来自 trade_buy_record (持久化), 若当日窗口也有该股, 附带 day_low
+    - 未买行: 当日窗口执行过但未买入的候选 (含未买原因 / 当日最低价)
+    股票名称优先取 trade_stock_basic.stock_name 权威映射 (与选股池/监控池一致),
+    映射缺失时回退到落库时的 name。
+    """
+    try:
+        from lib.selection_store import query_buy_records
+        rows = query_buy_records(limit=50)
+        from lib.selection_engine import _stock_name_map
+        name_map = _stock_name_map()
+    except Exception as e:
+        return {"items": [], "error": f"{type(e).__name__}: {e}"}
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    # 当日窗口执行详情 (含未买): {code -> 详情}
+    win_stocks: Dict[str, dict] = {}
+    try:
+        from live_trading.open_buy_window import OpenBuyWindowRunner
+        win = OpenBuyWindowRunner.load_status() or {}
+        if (win.get("date") or "") == today:
+            for x in (win.get("stocks") or []):
+                code = str(x.get("code") or "")
+                if code:
+                    win_stocks[code] = x
+    except Exception:
+        pass
+
+    items = []
+    for r in rows:
+        code = r["stock_code"]
+        is_today = str(r.get("ts") or "").startswith(today)
+        w = win_stocks.get(code) if is_today else None
+        day_low = (w or {}).get("day_low")
+        if day_low is None and is_today:
+            day_low = _window_day_low(code)  # 窗口任务未落盘时现场补算
+        items.append({
+            "code": code,
+            "name": name_map.get(code) or (r.get("name") or ""),
+            "ts": r.get("ts") or "",
+            "quantity": r.get("quantity") or 0,
+            "price": r.get("price"),
+            "amount": r.get("amount"),
+            "reason": r.get("reason") or "",
+            "strategy": r.get("strategy") or "",
+            "bought": 1,
+            "day_low": day_low,
+            "not_buy_reason": "",
+        })
+
+    # 当日窗口执行过但未成交的股票 (不在当日买入记录里) -> 追加为未买行
+    bought_today = {r["stock_code"] for r in rows if str(r.get("ts") or "").startswith(today)}
+    for code, w in win_stocks.items():
+        if code in bought_today:
+            continue
+        day_low = w.get("day_low")
+        if day_low is None:
+            day_low = _window_day_low(code)
+        items.append({
+            "code": code,
+            "name": name_map.get(code) or (w.get("name") or ""),
+            "ts": w.get("checked_at") or "",
+            "quantity": 0,
+            "price": None,
+            "amount": None,
+            "reason": w.get("buy_reason") or "",
+            "strategy": "weak_to_strong",
+            "bought": 0,
+            "day_low": day_low,
+            "not_buy_reason": w.get("not_buy_reason") or "",
+        })
+
+    # 已买在前(按时间倒序), 未买在后(按检查时间倒序) -- 稳定排序两步
+    items.sort(key=lambda x: str(x.get("ts") or ""), reverse=True)
+    items.sort(key=lambda x: int(x.get("bought") or 0), reverse=True)
+    return {"items": items}
 
 
 def _append_event(state: dict, level: str, title: str, source: str = "ceo_console") -> None:
@@ -198,6 +308,50 @@ def strategies_config_set(payload: dict = Body(...)):
 
 BINDING_SOURCE_FILE = PROJECT_ROOT / "config" / "binding_source.yaml"
 
+# ============================================================
+# 监控池「自动进入策略」配置
+#   记录哪些策略当日选出的候选会自动落入「监控池」。
+#   文件缺省(不存在)或列表为空 = 全部策略自动进入 (保持历史行为)。
+# ============================================================
+MONITOR_STRATEGIES_FILE = PROJECT_ROOT / "config" / "monitor_strategies.yaml"
+
+
+def _load_monitor_strategies() -> list:
+    """读监控池自动进入策略列表; 缺省 -> [] (前端视为"全部自动进入")."""
+    if not MONITOR_STRATEGIES_FILE.exists():
+        return []
+    try:
+        data = _yaml.safe_load(MONITOR_STRATEGIES_FILE.read_text(encoding="utf-8")) or {}
+        strategies = data.get("strategies") or []
+        return [str(s) for s in strategies if s]
+    except Exception:
+        return []
+
+
+def _save_monitor_strategies(strategies: list):
+    MONITOR_STRATEGIES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    text = _yaml.safe_dump({"strategies": [str(s) for s in strategies if s]},
+                           allow_unicode=True, sort_keys=True)
+    MONITOR_STRATEGIES_FILE.write_text(text, encoding="utf-8")
+
+
+@router.get("/monitor_strategies")
+def monitor_strategies_get():
+    """读监控池自动进入策略配置."""
+    return {"ok": True, "strategies": _load_monitor_strategies(),
+            "all": _load_monitor_strategies() == []}
+
+
+@router.post("/monitor_strategies")
+def monitor_strategies_set(payload: Dict[str, Any] = Body(default={})):
+    """保存监控池自动进入策略配置.
+
+    payload: {"strategies": ["weak_to_strong", "grid_classic"]}  (空列表 = 全部自动进入)
+    """
+    strategies = (payload or {}).get("strategies") or []
+    _save_monitor_strategies([str(s) for s in strategies if s])
+    return {"ok": True, "strategies": strategies}
+
 
 def _load_binding_sources() -> Dict[str, str]:
     if not BINDING_SOURCE_FILE.exists():
@@ -285,38 +439,23 @@ def daily_watch():
     数据源 trade_selection_pool(今日) + trade_strategy_position(实盘持仓, 判断已买入);
     names 覆盖 候选池∪持仓, 供「买入记录」「监控池」显示股票名称。
     """
+    import datetime
     from datetime import date
     from lib.selection_store import query_selection_pool, query_strategy_positions
     from lib.strategy_registry import get_strategy
     from lib.selection_engine import _stock_name_map
 
-    def label(n: str) -> str:
-        try:
-            meta = get_strategy(n)
-            if meta is not None:
-                return meta.label or n
-        except Exception:
-            pass
-        return n
-
     today = date.today().isoformat()
-    # 开盘买入窗口(09:29-09:35)最近落盘的判定详情: code -> {open_price, bought, buy_reason, not_buy_reason}
+    now = datetime.datetime.now()
+    # 休市判定: 非交易日(周末)整天 或 交易日已收盘(>=15:00) -> 清空候选/手动, 仅保留已买持仓
+    _closed = (now.weekday() >= 5) or (now.hour, now.minute) >= (15, 0)
+    # 开盘买入窗口(09:00:02-09:39:00)最近落盘的判定详情: code -> {open_price, day_low, bought, buy_reason, not_buy_reason}
     try:
         from live_trading.open_buy_window import OpenBuyWindowRunner
         _win = OpenBuyWindowRunner.load_status() or {}
         _win_stocks = {str(x.get("code")): x for x in (_win.get("stocks") or [])}
     except Exception:
         _win_stocks = {}
-    try:
-        # 监控池只显示策略自动(trigger='cron')选出的候选; 手动选股(trigger='manual')不入监控池。
-        # 取「最近一批」而非「今天」: 定时选股在 09:26 跑, 当日日线未入库,
-        # 写库 trade_date=昨日, 按今天过滤会导致监控池为空。
-        pool = query_selection_pool(trigger="cron") or []
-        if pool:
-            _latest = max(str(r["trade_date"]) for r in pool)
-            pool = [r for r in pool if str(r["trade_date"]) == _latest]
-    except Exception:
-        pool = []
     try:
         positions = query_strategy_positions() or []
     except Exception:
@@ -332,36 +471,45 @@ def daily_watch():
                 held.add(str(p.get("code", "")))
     except Exception:
         pass
-    items = []
-    need_names = set(held)
-    for r in pool:
-        code = str(r["stock_code"])
-        need_names.add(code)
-        wd = _win_stocks.get(code) or {}
-        items.append({
-            "code": code,
-            "name": (r.get("name") or ""),
-            "strategy": (r.get("strategy") or ""),
-            "strategy_label": label((r.get("strategy") or "")),
-            "selected_at": (r.get("selected_at") or r.get("trade_date") or ""),
-            "open_pct": r.get("open_pct"),
-            "bought": 1 if code in held else 0,
-            # 开盘买入窗口的判定详情 (监控池展示)
-            "open_price":     wd.get("open_price"),
-            "buy_reason":     wd.get("buy_reason") or "",
-            "not_buy_reason": wd.get("not_buy_reason") or "",
-        })
     try:
-        base = _stock_name_map()
+        base = _stock_name_map()  # 权威名称映射(trade_stock_basic), 优先于选股池 name 字段
     except Exception:
         base = {}
+    items = []
+    need_names = set(held)
+    # 手动添加的个股 (watch_pool.yaml) 显示在监控池, bought 标记是否已买入:
+    #   - 已买入(held) 的股票始终显示 (标 bought=1) —— 不会因全部买入而让监控池变空;
+    #   - 未买入的股票仅在盘中(_closed=False)显示, 收盘后清理非持仓。
+    try:
+        from lib.live_simulator import load_watch_pool
+        manual_codes = [str(c) for c in (load_watch_pool().get("codes") or [])]
+        for mc in manual_codes:
+            is_held = mc in held
+            if not is_held and _closed:
+                continue  # 收盘后仅保留持仓的自选股
+            need_names.add(mc)
+            items.append({
+                "code": mc,
+                "name": base.get(mc) or "",
+                "strategy": "",
+                "strategy_label": "手动添加",
+                "manual": 1,
+                "selected_at": today,
+                "open_pct": None,
+                "bought": 1 if is_held else 0,
+                "open_price": None,
+                "buy_reason": "",
+                "not_buy_reason": "",
+            })
+    except Exception:
+        pass
     names = {c: base.get(c, "") for c in need_names if base.get(c)}
     return {"items": items, "names": names, "monitor_date": today}
 
 
 @router.get("/open_buy_window")
 def open_buy_window_status():
-    """开盘买入窗口(09:29-09:35)任务进度 -- 读 OpenBuyWindowRunner 落盘状态
+    """开盘买入窗口(09:00:02-09:39:00)任务进度 -- 读 OpenBuyWindowRunner 落盘状态
 
     返回 (来自 outputs/live_open_buy_window.json):
       {
@@ -369,7 +517,7 @@ def open_buy_window_status():
         "window_end_count", "error_count", "cycle_seconds", "last_cycle_at",
         "last_error", "window_start", "window_end",
         "candidates": [...],        # 本轮候选代码
-        "stocks": [...],            # 每只候选判定详情 (任务状态/开盘价/已买·未买原因)
+        "stocks": [...],            # 每只候选判定详情 (任务状态/来自的策略/已买·未买原因)
         "orders": [...]             # 窗口内下单结果
       }
     """
@@ -386,11 +534,11 @@ def open_buy_window_status():
     data.setdefault("ordered_count", 0)
     data.setdefault("window_end_count", 0)
     data.setdefault("error_count", 0)
-    data.setdefault("cycle_seconds", 15)
+    data.setdefault("cycle_seconds", 30)
     data.setdefault("last_cycle_at", None)
     data.setdefault("last_error", None)
-    data.setdefault("window_start", "09:29")
-    data.setdefault("window_end", "09:35")
+    data.setdefault("window_start", "09:30:00")
+    data.setdefault("window_end", "09:45:00")
     data.setdefault("candidates", [])
     data.setdefault("stocks", [])
     data.setdefault("orders", [])
@@ -422,6 +570,53 @@ def watch_pool_set(payload: Optional[Dict[str, Any]] = Body(None)):
         return {"ok": True, "message": f"[OK] 监控列表已保存, 共 {len(codes)} 只", "codes": codes}
     except Exception as e:
         return {"ok": False, "message": str(e), "codes": []}
+
+
+@router.post("/watch_pool/manual_add")
+def watch_pool_manual_add(payload: Optional[Dict[str, Any]] = Body(None)):
+    """手动把一只个股加入监控池 (watch_pool.yaml, 去重); 可绑定策略 (缺省 weak_to_strong)。"""
+    payload = payload or {}
+    code = _normalize_stock_code(str(payload.get("code") or ""))
+    if not code:
+        return {"ok": False, "message": "股票代码不能为空"}
+    strategy = str(payload.get("strategy") or "").strip() or "weak_to_strong"
+    try:
+        from lib.live_simulator import load_watch_pool, save_watch_pool
+        existing = [str(c) for c in (load_watch_pool().get("codes") or [])]
+        if code in existing:
+            # 仅更新绑定策略 (不动 codes)
+            save_watch_pool(existing, bindings={code: strategy})
+            return {"ok": True, "message": f"[OK] {code} 已绑定策略 {strategy}",
+                    "code": code, "strategy": strategy, "added": False}
+        save_watch_pool(existing + [code], bindings={code: strategy})
+    except Exception as e:
+        return {"ok": False, "message": str(e)}
+    name = ""
+    try:
+        from lib.selection_engine import _stock_name_map
+        name = _stock_name_map().get(code, "")
+    except Exception:
+        name = ""
+    return {"ok": True, "message": f"[OK] {code} 已加入监控池", "code": code, "name": name, "added": True}
+
+
+@router.post("/watch_pool/delete")
+def watch_pool_delete(payload: Optional[Dict[str, Any]] = Body(None)):
+    """从监控池删除一只手动添加的股票 (watch_pool.yaml codes 中移除, 同步清理绑定策略)。"""
+    payload = payload or {}
+    code = _normalize_stock_code(str(payload.get("code") or ""))
+    if not code:
+        return {"ok": False, "message": "股票代码不能为空"}
+    try:
+        from lib.live_simulator import load_watch_pool, save_watch_pool
+        existing = [str(c) for c in (load_watch_pool().get("codes") or [])]
+        if code not in existing:
+            return {"ok": True, "message": f"{code} 不在监控池中", "code": code, "removed": False}
+        new_codes = [c for c in existing if c != code]
+        save_watch_pool(new_codes)
+        return {"ok": True, "message": f"[OK] {code} 已从监控池删除", "code": code, "removed": True}
+    except Exception as e:
+        return {"ok": False, "message": str(e)}
 
 
 # ============================================================
@@ -609,6 +804,65 @@ def real_order_cancel(payload: Optional[Dict[str, Any]] = Body(None)):
     if result == 0:
         return {"ok": True, "message": f"已提交撤单请求: 编号 {order_id}"}
     return {"ok": False, "message": f"撤单失败: 编号 {order_id}, miniQMT 返回 {result}"}
+
+
+@router.post("/position_sell")
+def position_sell(payload: Optional[Dict[str, Any]] = Body(None)):
+    """持仓手动卖出 (实时持仓表「卖出」按钮): miniQMT 市价卖出.
+
+    body: {"code": "600519.SH", "quantity": <int 可选, 不传或 0 = 卖全部可用持仓>}
+
+    校验: 实盘账户须持有该股且可用数量足够 (T+1: 当日买入部分被冻结不可卖).
+    """
+    payload = payload or {}
+    code = str(payload.get("code", "")).strip()
+    if not code:
+        return {"ok": False, "message": "code 不能为空"}
+
+    try:
+        quantity = int(payload.get("quantity") or 0)   # 0 = 全部可用
+    except (TypeError, ValueError):
+        return {"ok": False, "message": f"quantity 必须是整数, 收到: {payload.get('quantity')!r}"}
+    if quantity < 0:
+        return {"ok": False, "message": "quantity 不能为负"}
+
+    # 强制绕过 5 秒缓存拉最新持仓 (T+1 可用数量必须实时)
+    _REAL_CACHE["ts"] = 0.0
+    try:
+        trader = _get_real_trader()
+        positions = trader.query_positions() or []
+    except Exception as e:
+        return {"ok": False, "message": f"获取实盘持仓失败: {type(e).__name__}: {e}"}
+
+    match = next((p for p in positions if p.get("stock_code") == code), None)
+    if not match:
+        return {"ok": False, "message": f"实盘账户没有 {code} 持仓, 无法卖出"}
+    can_use = int(match.get("can_use_volume") or 0)
+    volume = int(match.get("volume") or 0)
+    if can_use <= 0:
+        return {"ok": False, "message": f"{code} 可用持仓为 0 (T+1: 当日买入明日才可卖)"}
+
+    sell_qty = quantity if quantity > 0 else can_use
+    if quantity > 0 and quantity > can_use:
+        return {"ok": False,
+                "message": f"可用持仓不足: {code} 可卖 {can_use} 股 < 请求 {quantity} 股"}
+
+    try:
+        order_id = trader.sell(code, sell_qty, price=0,   # 0 = 市价
+                               strategy_name="manual", remark="position_sell")
+    except Exception as e:
+        return {"ok": False, "message": f"下单异常: {type(e).__name__}: {e}"}
+
+    # 让缓存过期, 下一次 real_account 立即拉新
+    _REAL_CACHE["ts"] = 0.0
+
+    if order_id is None or order_id < 0:
+        return {"ok": False, "message": f"卖出失败: miniQMT 返回 order_id={order_id}"}
+    return {"ok": True,
+            "message": f"已提交市价卖出 {code} {sell_qty} 股 (委托编号 {order_id})",
+            "order": {"order_id": order_id, "code": code, "side": "sell",
+                      "quantity": sell_qty, "price": 0},
+            "volume": volume, "can_use": can_use}
 
 
 # ============================================================
@@ -876,7 +1130,7 @@ def approvals_reject(payload: Optional[Dict[str, Any]] = Body(None)):
 def stock_bind(payload: Optional[Dict[str, Any]] = Body(None)):
     """添加一只股票到监控列表, 并写入 per_stock 策略绑定 (写盘 + 热加载)
 
-    body: {"code": "002432.SZ", "strategy": "dual_ma_5min", "source": "sim"|"real"}
+    body: {"code": "002432.SZ", "strategy": "grid_classic", "source": "sim"|"real"}
     source 默认 'sim'; 'real' 表示这只股票是从「实盘」视图绑的, 模拟盘的「待入场」不显示它.
     """
     payload = payload or {}
@@ -914,9 +1168,9 @@ def stock_bind(payload: Optional[Dict[str, Any]] = Body(None)):
         cfg = load_strategy_config()
         per = dict(cfg.get("per_stock") or {})
         per[code] = strategy
-        default = cfg.get("default", "macd_5min")
+        default = cfg.get("default", "grid_classic")
         if default not in valid_names:
-            default = "macd_5min"
+            default = "grid_classic"
 
         msg = _SIM.apply_strategy_config(default=default, per_stock=per)
         _set_binding_source(code, source)
@@ -966,10 +1220,10 @@ def stock_unbind(payload: Optional[Dict[str, Any]] = Body(None)):
         if code in per:
             per.pop(code, None)
             actions.append(f"已解除策略绑定")
-        default = cfg.get("default", "macd_5min")
+        default = cfg.get("default", "grid_classic")
         valid_names = {s["name"] for s in list_strategies()}
         if default not in valid_names:
-            default = "macd_5min"
+            default = "grid_classic"
         msg = _SIM.apply_strategy_config(default=default, per_stock=per)
         _drop_binding_source(code)
 

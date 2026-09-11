@@ -16,7 +16,7 @@ backtest_engine -- 在历史日 K 上回放已注册策略，算信号 + 撮合 
     - 整手: 取整到 100 股的整数倍 (沪深 A 股最小单位)
 
 注意:
-    - 5 分钟周期策略 (macd_5min/dual_ma_5min/dragon_picker) 在回测时只能拿到日 K,
+    - 5 分钟周期策略在回测时只能拿到日 K,
       它们内部 _safe_kline(period='5m') 会返回 None -> 策略自动 hold, 不会假信号.
       想真做 5 分钟回测要接 xtdata 1m/5m, 后续扩展.
     - 仅做单股回测; 多股组合回测可后续扩展.
@@ -108,7 +108,7 @@ def run_backtest(stock_code: str,
 
     Args:
         stock_code:   '600519.SH'
-        strategy_name: strategy_registry 中的注册名 (macd_1d / dual_ma_5min / ...)
+        strategy_name: strategy_registry 中的注册名 (grid_classic / weak_to_strong / ...)
         start_date:   'YYYY-MM-DD' (撮合区间起点; warmup_bars 会向前多拿一些以便策略指标预热)
         end_date:     'YYYY-MM-DD'
         initial_cash: 初始资金, 默认读 .env BACKTEST_INITIAL_CASH (1,000,000)

@@ -26,7 +26,7 @@ from lib.selection_engine import (
     build_universe_snapshot, run_strategy_selection, clear_snapshot_cache,
 )
 from lib.selection_store import (
-    ensure_tables, replace_selection_pool_daily, sync_pool_to_watch_pool,
+    ensure_tables, replace_selection_pool_daily,
 )
 
 # 选股配置文件
@@ -187,18 +187,6 @@ def run_all_selection(trigger: str = "manual", selected_at: Optional[str] = None
         written = 0
         reasons["_db"] = f"选股池写库失败: {e}"
 
-    # 自动(定时)选股: 选出的候选并入监控池 watch_pool.yaml; 手动选股(trigger=manual)不入池
-    if trigger != "manual":
-        try:
-            all_codes = list({r["stock_code"] for lst in per_strategy.values()
-                              for r in lst if isinstance(r, dict)})
-            if all_codes:
-                added = sync_pool_to_watch_pool(all_codes)
-                if added:
-                    print(f"[selection] 已并入监控池 {len(added)} 只 (新增)", flush=True)
-        except Exception as e:
-            reasons["_watch_pool"] = f"监控池同步失败: {e}"
-
     # 写 live_state.json (selection 字段)
     selected_total = sum(len(v) for v in per_strategy.values())
     try:
@@ -228,11 +216,15 @@ def run_all_selection(trigger: str = "manual", selected_at: Optional[str] = None
     }
 
 
-def run_one_selection(name: str, trigger: str = "cron") -> dict:
+def run_one_selection(name: str, trigger: str = "cron",
+                      selected_at: Optional[str] = None) -> dict:
     """仅对单个指定(且启用)策略跑一次选股, 写入选股池(库+json)。
-    供'每策略各自选股时间'的定时调度逐策略触发; 不干扰其它策略的既有结果。"""
+    供'每策略各自选股时间'的定时调度逐策略触发; 不干扰其它策略的既有结果。
+    selected_at: 入选时间 "YYYY-MM-DD HH:MM:SS" -- 历史回放时传历史日期,
+                 以该日为"今日"截断日线面板回放选股(该日无盘中注入); 缺省=最新交易日实时选股。"""
     now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     ensure_tables()
+    sel_time = _normalize_selected_at(selected_at)
 
     cfg = load_selection_config()
     inst = next((s for s in cfg.get("strategies", [])
@@ -243,7 +235,9 @@ def run_one_selection(name: str, trigger: str = "cron") -> dict:
 
     try:
         clear_snapshot_cache()
-        snapshot = build_universe_snapshot(int(inst.get("lookback_days") or 120))
+        asof = (sel_time or "")[:10]
+        snapshot = build_universe_snapshot(int(inst.get("lookback_days") or 120),
+                                           asof_date=asof or None)
     except Exception as e:
         return {"ok": False, "message": f"快照构建失败: {e}", "name": name, "last_run_at": now}
 
@@ -259,22 +253,11 @@ def run_one_selection(name: str, trigger: str = "cron") -> dict:
 
     per_strategy = {name: rows}
     try:
-        written = replace_selection_pool_daily(per_strategy, trade_date, trigger=trigger)
+        written = replace_selection_pool_daily(per_strategy, trade_date,
+                                               selected_at=sel_time, trigger=trigger)
     except Exception as e:
         written = 0
         reason = reason or f"选股池写库失败: {e}"
-
-    # 自动(定时)选股: 选出的候选并入监控池 watch_pool.yaml; 手动选股(trigger=manual)不入池
-    if trigger != "manual":
-        try:
-            codes = [r["stock_code"] for r in rows if isinstance(r, dict)]
-            if codes:
-                added = sync_pool_to_watch_pool(codes)
-                if added:
-                    print(f"[selection] 策略 {name}: 已并入监控池 {len(added)} 只 (新增)",
-                          flush=True)
-        except Exception as e:
-            reason = reason or f"监控池同步失败: {e}"
 
     by_strategy = {name: {
         "last_run_at": now, "total": len(rows), "selected": len(rows),

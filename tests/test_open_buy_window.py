@@ -58,7 +58,7 @@ def freeze_time(y, mo, d, h, mi, s=0):
 
 # 2026-09-09 是周三 (weekday=2, 工作日); 用它的 09:30 作为窗口内时间
 INSIDE = (2026, 9, 9, 9, 30)
-OUTSIDE_AFTER = (2026, 9, 9, 9, 36)     # 窗口刚结束
+OUTSIDE_AFTER = (2026, 9, 9, 9, 40)     # 窗口结束后 (09:39 之后)
 OUTSIDE_EARLY = (2026, 9, 9, 9, 28)     # 窗口开始前
 WEEKEND_INSIDE = (2026, 9, 12, 9, 30)   # 2026-09-12 周六, 即使窗口内也不算
 
@@ -145,9 +145,26 @@ class TestTodayCandidates(unittest.TestCase):
         ]
         runner = fresh_runner()
         with mock.patch("lib.selection_store.query_selection_pool", return_value=rows), \
+                mock.patch("lib.live_simulator.load_watch_pool",
+                           return_value={"codes": []}), \
                 freeze_time(*INSIDE):
             self.assertEqual(runner._today_candidates(),
                              ["600519.SH", "000001.SZ"])
+
+    def test_merges_watch_pool_manual_codes(self):
+        """候选来源=当日监控池: 选股池当日候选 + 手动监控池代码, 去重"""
+        rows = [
+            {"stock_code": "600519.SH", "trade_date": "2026-09-09", "source_type": "cron"},
+        ]
+        runner = fresh_runner()
+        with mock.patch("lib.selection_store.query_selection_pool", return_value=rows), \
+                mock.patch("lib.live_simulator.load_watch_pool",
+                           return_value={"codes": ["600519.SH", "000001.SZ"]}), \
+                mock.patch("lib.selection_engine._stock_name_map",
+                           return_value={"000001.SZ": "平安银行"}), \
+                freeze_time(*INSIDE):
+            cands = runner._today_candidates()
+            self.assertEqual(cands, ["600519.SH", "000001.SZ"])  # 600519 去重保留一次
 
 
 class TestEvaluateAndOrder(unittest.TestCase):

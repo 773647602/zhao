@@ -59,6 +59,22 @@ CREATE TABLE IF NOT EXISTS trade_strategy_position (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 """
 
+_BUY_RECORD_DDL = """
+CREATE TABLE IF NOT EXISTS trade_buy_record (
+  id         BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  ts         VARCHAR(32)  NOT NULL,           -- 买入时间 (ISO, 幂等键)
+  stock_code VARCHAR(16)  NOT NULL,
+  name       VARCHAR(64)  NULL,
+  quantity   INT UNSIGNED NOT NULL DEFAULT 0,
+  price      DECIMAL(12,4) NULL,              -- 买入价格
+  amount     DECIMAL(16,2) NULL,              -- 成交金额
+  strategy   VARCHAR(64) NULL,
+  reason     VARCHAR(512) NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uk_ts_code (ts, stock_code)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+"""
+
 
 def ensure_tables() -> None:
     """建表 (幂等, app 启动时调用一次)"""
@@ -67,7 +83,7 @@ def ensure_tables() -> None:
     conn = pymysql.connect(**cfg)
     try:
         cur = conn.cursor()
-        for ddl in (_POOL_DDL, _POS_DDL):
+        for ddl in (_POOL_DDL, _POS_DDL, _BUY_RECORD_DDL):
             cur.execute(ddl)
         # 已有表补列 selected_at / open_pct / cur_pct / trigger (幂等: 已存在则跳过)
         for col, ddl in (
@@ -205,6 +221,93 @@ def query_selection_pool(
     return rows
 
 
+def backfill_selection_cur_pct() -> int:
+    """休市后补齐选股池「当日涨幅」(cur_pct): 每行按其**入选当日**的收盘涨幅回填.
+
+    当日涨幅 = (入选日收盘 - 该股入选日前一交易日收盘) / 前收 * 100。
+    按行自身的 trade_date 取日线, 历史行不会被最新日线覆盖;
+    入选日日线尚未入库的行跳过(等日线入库后再次调用补齐)。
+    需在日线已入库后调用(如 20:00 日线增量完成之后)。盘中不刷新, 休市后一次性补齐。
+    """
+    import pymysql
+    cfg = _db_config()
+    conn = pymysql.connect(**cfg)
+    updated = 0
+    try:
+        upd = conn.cursor()
+        upd.execute(
+            "UPDATE trade_selection_pool p "
+            "JOIN trade_stock_daily d1 ON d1.stock_code = p.stock_code AND d1.trade_date = p.trade_date "
+            "JOIN trade_stock_daily d0 ON d0.stock_code = p.stock_code "
+            "  AND d0.trade_date = (SELECT MAX(t.trade_date) FROM trade_stock_daily t "
+            "                       WHERE t.stock_code = p.stock_code AND t.trade_date < p.trade_date) "
+            "SET p.cur_pct = ROUND((d1.close_price - d0.close_price) / d0.close_price * 100, 2) "
+            "WHERE p.stock_code <> '' AND d1.close_price > 0 AND d0.close_price > 0"
+        )
+        updated = upd.rowcount
+        conn.commit()
+        upd.close()
+    finally:
+        conn.close()
+    return updated
+
+
+def update_selection_cur_pct(pct_map: dict, trade_date: Optional[str] = None) -> int:
+    """按 {stock_code: 当前涨幅%} 实时回填 trade_selection_pool.cur_pct.
+
+    供 13:00(盘中) / 15:00(收盘) 定时任务用; pct_map 不含的代码不更新。
+    trade_date 传入时仅更新该入选日的行, 避免跨日期覆盖历史行的收盘涨幅。
+    """
+    if not pct_map:
+        return 0
+    import pymysql
+    cfg = _db_config()
+    conn = pymysql.connect(**cfg)
+    updated = 0
+    try:
+        upd = conn.cursor()
+        for code, pct in pct_map.items():
+            if code is None or pct is None:
+                continue
+            if trade_date:
+                upd.execute(
+                    "UPDATE trade_selection_pool SET cur_pct = %s "
+                    "WHERE stock_code = %s AND trade_date = %s",
+                    (float(pct), str(code), trade_date),
+                )
+            else:
+                upd.execute(
+                    "UPDATE trade_selection_pool SET cur_pct = %s WHERE stock_code = %s",
+                    (float(pct), str(code)),
+                )
+            updated += upd.rowcount
+        conn.commit()
+        upd.close()
+    finally:
+        conn.close()
+    return updated
+
+
+def latest_selection_day() -> Optional[str]:
+    """最近一次选股入选日(当天选股时的交易日)"""
+    import pymysql
+    cfg = _db_config()
+    conn = pymysql.connect(**cfg)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT trade_date FROM trade_selection_pool "
+            "ORDER BY id DESC LIMIT 1"
+        )
+        row = cur.fetchone()
+        cur.close()
+        return str(row[0]) if row and row[0] else None
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+
 def latest_pool_trade_date() -> Optional[str]:
     """最近一次选股写入的 trade_date"""
     import pymysql
@@ -218,6 +321,80 @@ def latest_pool_trade_date() -> Optional[str]:
         return str(row[0]) if row and row[0] else None
     finally:
         conn.close()
+
+
+# ============================================================
+# 买入记录读写 (实际买入成交的买单, 幂等键 (ts, stock_code))
+# ============================================================
+
+def save_buy_record(order: Dict[str, Any]) -> int:
+    """把一笔买入成交写进 trade_buy_record (幂等: (ts, stock_code) 已存在则跳过)。
+
+    order: 买入订单 dict (来自 live_state / 开盘买入窗口), 需含 code/ts, 可选
+    quantity/price/amount/strategy/reason/name。
+    """
+    code = str(order.get("code") or "")
+    ts = str(order.get("ts") or "")
+    if not code or not ts:
+        return 0
+    import pymysql
+    cfg = _db_config()
+    conn = pymysql.connect(**cfg)
+    try:
+        cur = conn.cursor()
+        sql = (
+            "INSERT INTO trade_buy_record "
+            "(ts, stock_code, name, quantity, price, amount, strategy, reason) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s) "
+            "ON DUPLICATE KEY UPDATE id = id"   # 已存在则保持原样 (幂等)
+        )
+        cur.execute(sql, (
+            ts[:23], code,
+            order.get("name"),
+            int(order.get("quantity") or 0),
+            order.get("price"),
+            order.get("amount"),
+            order.get("strategy"),
+            (order.get("reason") or "")[:512],
+        ))
+        conn.commit()
+        n = cur.rowcount
+        cur.close()
+        return 1 if n == 1 else 0
+    finally:
+        conn.close()
+
+
+def query_buy_records(limit: int = 50) -> List[dict]:
+    """查询最近 N 笔买入成交, 按时间倒序"""
+    import pymysql
+    cfg = _db_config()
+    conn = pymysql.connect(**cfg)
+    try:
+        cur = conn.cursor(pymysql.cursors.DictCursor)
+        cur.execute(
+            "SELECT ts, stock_code, name, quantity, price, amount, strategy, reason "
+            "FROM trade_buy_record ORDER BY ts DESC, id DESC LIMIT %s",
+            (int(limit),),
+        )
+        rows = cur.fetchall()
+        cur.close()
+        return rows
+    finally:
+        conn.close()
+
+
+def backfill_buy_records_from_orders(orders: List[dict]) -> int:
+    """把既是 buy 且已成交(submitted) 的订单批量落库 (幂等), 用于存量/兜底回填"""
+    n = 0
+    for o in orders or []:
+        if (o.get("side") != "buy"
+                or o.get("status", "submitted") != "submitted"):
+            continue
+        if not o.get("amount") and o.get("quantity") and o.get("price"):
+            o = {**o, "amount": float(o["quantity"]) * float(o["price"])}
+        n += save_buy_record(o)
+    return n
 
 
 # ============================================================

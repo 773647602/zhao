@@ -10,8 +10,8 @@ GET  /api/backtest/batch/{task_id}   -- 轮询批量回测任务进度/结果
 请求示例:
     POST /api/backtest/batch
     {"mode":"pool","selection_strategy":"weak_to_strong","trade_date":"2026-09-07",
-     "strategy":"macd_1d","start":"2026-09-08","end":"2026-09-08"}
-    {"mode":"daily","codes":"600519.SH,000001.SZ","strategy":"macd_1d",
+     "strategy":"grid_classic","start":"2026-09-08","end":"2026-09-08"}
+    {"mode":"daily","codes":"600519.SH,000001.SZ","strategy":"grid_classic",
      "start":"2024-01-01","end":"2025-12-31"}
 """
 
@@ -228,7 +228,7 @@ def backtest_batch_start(payload: Dict[str, Any] = Body(default={})):
         "codes":  "600519.SH,000001.SZ" (可选; 缺省=全市场有日线股票, 上限 max_stocks),
         "max_stocks": 300 (daily 缺省全市场时的上限),
         # 通用:
-        "strategy": "macd_1d",         # 交易策略 (registry)
+        "strategy": "grid_classic",         # 交易策略 (registry)
         "start": "YYYY-MM-DD",
         "end":   "YYYY-MM-DD",
         "initial_cash": 1000000        # 可选

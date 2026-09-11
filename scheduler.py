@@ -8,7 +8,7 @@ TradingScheduler -- 按 A 股交易时段自动启停 +（可选）板块日更�
     - APScheduler + cron。
 
 5 个 cron job（时区 Asia/Shanghai）:
-    20:00   job_daily_increment   -> 日线增量入库 (大QMT拉最近已收盘交易日 + 新浪修占位/价格异常), 每日执行
+    15:00   job_daily_increment   -> 日线增量入库 (大QMT拉最近已收盘交易日 + 新浪修占位/价格异常), 每日执行
     08:30   job_data_refresh      -> .env 中 CASE_A_BOARD_DATA_PREP_DIR/run_daily.py (周一至周五)
 09:00   job_start_engine      -> 启动实盘主循环 LiveSimRunner(dry_run=False, 周一至周五)
     14:55   job_stop_engine       -> 停止主循环 (周一至周五)
@@ -104,7 +104,7 @@ def _latest_trade_date() -> str:
 
 
 def job_daily_increment():
-    """20:00: 每日日线增量入库 -- 大QMT拉取最近已收盘交易日未入库日线, 占位/价格异常用新浪修复"""
+    """15:00: 每日日线增量入库 -- 大QMT拉取最近已收盘交易日未入库日线, 占位/价格异常用新浪修复"""
     log.info("[JOB] 日线增量 - 触发")
     script = PROJECT_ROOT / "data" / "sjhq" / "日线数据-国金QMT入库.py"
     target = _latest_trade_date()
@@ -113,6 +113,13 @@ def job_daily_increment():
         cwd=str(PROJECT_ROOT),
     )
     log.info("[JOB] 日线增量 - 完成 (returncode=%s, target=%s)", ret.returncode, target)
+    # 日线入库后: 选股池「当日涨幅」按入选当日收盘涨幅补齐 (含历史行纠错)
+    try:
+        from lib.selection_store import backfill_selection_cur_pct
+        n = backfill_selection_cur_pct()
+        log.info("[JOB] 选股池当日涨幅(收盘)补齐 - 完成 (更新 %s 行)", n)
+    except Exception as e:
+        log.error("[JOB] 选股池当日涨幅(收盘)补齐失败: %s", e)
 
 
 def job_minute_increment():
@@ -127,6 +134,90 @@ def job_minute_increment():
     log.info("[JOB] 分钟线增量 - 完成 (returncode=%s)", ret_m.returncode)
 
 
+def job_pool_cur_pct_backfill():
+    """13:00 / 15:00: 选股池「当前涨幅」(cur_pct) 定时更新 -- 用实时行情拉当日涨幅回填.
+
+    13:00 取盘中实时涨幅; 15:00 收盘后 lastPrice 定格为当日收盘价, 即当日全天涨幅。
+    非更新时刻页面显示为空(见 pool.html / pool_page.py 的时间判断)。
+    """
+    log.info("[JOB] 选股池当前涨幅定时更新 - 触发")
+    try:
+        from live_trading.live_loop import MarketDataProvider
+        from lib.selection_store import (
+            update_selection_cur_pct,
+            latest_selection_day,
+            latest_pool_trade_date,
+        )
+        # 仅更新最近一批入选股(当天选股)而非全库历史
+        sel_day = latest_selection_day()
+        pool_td = latest_pool_trade_date()
+        day = sel_day or pool_td
+        if not day:
+            log.info("[JOB] 选股池为空(无入选记录), 跳过")
+            return
+        import pymysql
+        from lib.backtest_data import _db_config
+        cfg = _db_config()
+        conn = pymysql.connect(**cfg)
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT DISTINCT stock_code FROM trade_selection_pool "
+                "WHERE stock_code <> '' AND trade_date = %s",
+                (day,),
+            )
+            codes = [str(r[0]) for r in cur.fetchall()]
+            cur.close()
+        finally:
+            conn.close()
+        if not codes:
+            log.info("[JOB] 当日无候选, 跳过")
+            return
+        mdp = MarketDataProvider()
+        ticks = mdp.get_full_ticks(codes)
+        pct_map = {}
+        for code in codes:
+            t = ticks.get(code)
+            if not t:
+                continue
+            last = float(t.get("lastPrice") or 0)
+            pre = 0.0
+            for k in ("preClose", "lastClose", "last_close", "prevClose", "pre_close"):
+                v = t.get(k)
+                if v:
+                    try:
+                        pre = float(v)
+                        break
+                    except (TypeError, ValueError):
+                        continue
+            if last > 0 and pre > 0:
+                pct_map[code] = round((last - pre) / pre * 100, 2)
+        updated = update_selection_cur_pct(pct_map, trade_date=day)
+        log.info("[JOB] 选股池当前涨幅定时更新 - 完成 (候选 %s, 更新 %s 行, day=%s)", len(codes), updated, day)
+    except Exception as e:
+        log.error("[JOB] 选股池当前涨幅定时更新失败: %s", e)
+
+
+def job_market_volume():
+    """15:02: 每日沪深两市成交总额入库 -- 新浪指数接口(上证指数+深证综指), 收盘后自动更新."""
+    log.info("[JOB] 市场量能更新 - 触发")
+    try:
+        from lib.free_market import get_market_total_amount
+        from lib.market_metrics import upsert_market_volume
+        amounts = get_market_total_amount()
+        today = datetime.now().strftime("%Y-%m-%d")
+        upsert_market_volume(today, amounts, source="sina")
+        log.info(
+            "[JOB] 市场量能更新 - 完成 (date=%s, 沪=%s元, 深=%s元, 两市=%s元)",
+            today,
+            f"{amounts['sh']:.2e}",
+            f"{amounts['sz']:.2e}",
+            f"{amounts['total']:.2e}",
+        )
+    except Exception as e:
+        log.error("[JOB] 市场量能更新失败: %s", e)
+
+
 def job_start_engine():
     log.info("[JOB] 启动主循环 - 触发")
     sim = LiveSimRunner()
@@ -137,13 +228,14 @@ def job_start_engine():
     if not watch:
         log.warning("[JOB] 监控池为空, 不启动")
         return
-    # 恒为实盘 (不再有模拟盘): 直接以 dry_run=False 启动, 满足买入规则即真实下单
+    # 恒为实盘 (不再有模拟盘): 主循环只同步持仓/盈亏/心跳, 不买卖
+    # (买入 = 09:00 开盘买入窗口任务, 卖出 = 持仓页手动卖出)
     msg = sim.start(watch_stocks=watch, dry_run=False, init_positions=False, cycle_seconds=60)
-    log.info(f"[JOB] 启动主循环 - 完成: {msg.splitlines()[0] if msg else 'OK'} (mode=REAL)")
+    log.info(f"[JOB] 启动主循环 - 完成: {msg.splitlines()[0] if msg else 'OK'} (mode=REAL, 仅数据同步)")
 
 
 def job_open_buy_window_start():
-    """09:29: 启动弱转强开盘买入窗口 (09:29-09:35 每 15 秒 tick 监控买入, 到点自动停止)"""
+    """09:30 启动弱转强开盘买入窗口 (09:30:00-09:45:00 每 30 秒 tick 监控买入, 到点自动停止)"""
     log.info("[JOB] 开盘买入窗口 - 触发")
     try:
         from live_trading.open_buy_window import OpenBuyWindowRunner
@@ -196,6 +288,8 @@ def main():
             job_data_refresh()
             job_daily_increment()
             job_minute_increment()
+            job_pool_cur_pct_backfill()
+            job_market_volume()
         if args.job in ("engine", "all"):
             job_start_engine()
             job_stop_engine()
@@ -215,10 +309,10 @@ def main():
         sched.add_job(
             job_daily_increment,
             id="daily_increment",
-            name="20:00 日线增量",
-            trigger=CronTrigger(hour=20, minute=0, timezone="Asia/Shanghai"),
+            name="15:00 日线增量",
+            trigger=CronTrigger(hour=15, minute=0, timezone="Asia/Shanghai"),
         )
-        log.info("[REG] 20:00 日线增量 (每日, 大QMT拉最近已收盘交易日 + 新浪修占位/价格异常)")
+        log.info("[REG] 15:00 日线增量 (每日, 大QMT拉最近已收盘交易日 + 新浪修占位/价格异常)")
         sched.add_job(
             job_minute_increment,
             id="minute_increment",
@@ -227,6 +321,29 @@ def main():
                                 timezone="Asia/Shanghai"),
         )
         log.info("[REG] 15:35 分钟线增量 (周一至周五, 当日1分钟K线)")
+        sched.add_job(
+            job_pool_cur_pct_backfill,
+            id="pool_cur_pct_at13",
+            name="13:00 选股池当前涨幅(盘中)",
+            trigger=CronTrigger(hour=13, minute=0, day_of_week="mon-fri",
+                                timezone="Asia/Shanghai"),
+        )
+        sched.add_job(
+            job_pool_cur_pct_backfill,
+            id="pool_cur_pct_at15",
+            name="15:00 选股池当前涨幅(收盘)",
+            trigger=CronTrigger(hour=15, minute=0, day_of_week="mon-fri",
+                                timezone="Asia/Shanghai"),
+        )
+        log.info("[REG] 13:00 / 15:00 选股池当前涨幅定时更新 (实时行情)")
+        sched.add_job(
+            job_market_volume,
+            id="market_volume",
+            name="15:02 市场量能",
+            trigger=CronTrigger(hour=15, minute=2, day_of_week="mon-fri",
+                                timezone="Asia/Shanghai"),
+        )
+        log.info("[REG] 15:02 市场量能 (每日两市成交总额, 新浪指数)")
 
     if args.job in ("engine", "all"):
         sched.add_job(
@@ -239,8 +356,8 @@ def main():
         sched.add_job(
             job_open_buy_window_start,
             id="open_buy_window",
-            name="09:29 弱转强开盘买入窗口",
-            trigger=CronTrigger(hour=9, minute=29, day_of_week="mon-fri",
+            name="09:30 开盘买入窗口",
+            trigger=CronTrigger(hour=9, minute=30, day_of_week="mon-fri",
                                 timezone="Asia/Shanghai"),
         )
         sched.add_job(
@@ -251,7 +368,7 @@ def main():
                                 timezone="Asia/Shanghai"),
         )
         log.info("[REG] 09:00 / 14:55 引擎启停")
-        log.info("[REG] 09:29 弱转强开盘买入窗口 (09:29-09:35 每 15s 判定买入)")
+        log.info("[REG] 09:30 开盘买入窗口 (09:30:00-09:45:00 每 30s 判定买入)")
 
     log.info("=" * 60)
     log.info("[BOOT] 调度器前台运行（Ctrl+C 退出） cwd=%s", PROJECT_ROOT)

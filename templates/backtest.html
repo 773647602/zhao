@@ -152,11 +152,15 @@
                 <template x-if="batch.mode === 'standard'">
                     <div class="md:col-span-12 grid grid-cols-1 md:grid-cols-12 gap-3 items-end">
                         <div class="md:col-span-4">
-                            <label class="block text-xs text-gray-600 mb-1">股票代码（逗号分隔，留空 = 全市场前 300 只）</label>
-                            <input type="text" class="form-input w-full" x-model="batch.codes"
-                                   placeholder="600519.SH,000001.SZ" @keyup.enter="startBatch()">
+                            <label class="block text-xs text-gray-600 mb-1">选股策略<span class="text-[11px] text-gray-400">（可选，选择后只回测该策略选出的股票）</span></label>
+                            <select class="form-select w-full" x-model="batch.standardSelStrategy">
+                                <option value="">全市场（有日线的股票）</option>
+                                <template x-for="s in poolMeta.strategies" :key="s">
+                                    <option :value="s" x-text="s"></option>
+                                </template>
+                            </select>
                         </div>
-                        <div class="md:col-span-3">
+                        <div class="md:col-span-4">
                             <label class="block text-xs text-gray-600 mb-1">交易策略</label>
                             <select class="form-select w-full" x-model="batch.strategy">
                                 <template x-for="s in strategies" :key="s.name">
@@ -164,7 +168,13 @@
                                 </template>
                             </select>
                         </div>
-                        <div class="md:col-span-3 flex gap-2">
+                        <div class="md:col-span-4 flex justify-end">
+                            <button class="btn btn-primary btn-lg w-full" @click="startBatch()" :disabled="batch.running">
+                                <span x-show="!batch.running">📊 开始标准回测</span>
+                                <span x-show="batch.running">运行中...</span>
+                            </button>
+                        </div>
+                        <div class="md:col-span-12 flex gap-4">
                             <div class="flex-1">
                                 <label class="block text-xs text-gray-600 mb-1">起始日期</label>
                                 <input type="date" class="form-input w-full" x-model="batch.start">
@@ -173,12 +183,6 @@
                                 <label class="block text-xs text-gray-600 mb-1">结束日期</label>
                                 <input type="date" class="form-input w-full" x-model="batch.end">
                             </div>
-                        </div>
-                        <div class="md:col-span-2 flex justify-end">
-                            <button class="btn btn-primary btn-lg w-full" @click="startBatch()" :disabled="batch.running">
-                                <span x-show="!batch.running">📊 开始标准回测</span>
-                                <span x-show="batch.running">运行中...</span>
-                            </button>
                         </div>
                     </div>
                 </template>
@@ -328,8 +332,8 @@ function backtestApp() {
             mode: 'fast',              // fast=快速回测(选股池) / standard=标准回测(日线)
             selectionStrategy: '',     // 选股策略 (快速回测)
             tradeDate: '',             // 选股时间 (空=全部交易日)
-            codes: '',                 // 股票代码 (标准回测)
-            strategy: 'macd_1d',       // 交易策略
+            standardSelStrategy: '',   // 标准回测: 可选选股策略限定范围 (空=全市场)
+            strategy: 'grid_classic',       // 交易策略
             start: fmt(oneYearAgo),
             end:   fmt(today),
             running: false,
@@ -390,22 +394,29 @@ function backtestApp() {
         async startBatch() {
             if (this.batch.running) return;
             this.errMsg = '';
-            const apiMode = this.batch.mode === 'fast' ? 'pool' : 'daily';
+            const isFast = this.batch.mode === 'fast';
             const payload = {
-                mode: apiMode,
+                mode: isFast ? 'pool' : (this.batch.standardSelStrategy ? 'pool' : 'daily'),
                 strategy: this.batch.strategy,
                 start: this.batch.start,
                 end:   this.batch.end,
             };
-            if (apiMode === 'pool') {
+            if (isFast) {
                 if (!this.batch.selectionStrategy) {
                     this.errMsg = '请先选择选股策略';
                     return;
                 }
+                payload.mode = 'pool';
                 payload.selection_strategy = this.batch.selectionStrategy;
                 payload.trade_date = this.batch.tradeDate;
+            } else if (this.batch.standardSelStrategy) {
+                // 标准回测: 选了选股策略 -> 用该策略选股池股票作为完整日线回测范围
+                payload.mode = 'pool';
+                payload.selection_strategy = this.batch.standardSelStrategy;
+                payload.trade_date = '';
             } else {
-                payload.codes = (this.batch.codes || '').trim();
+                // 标准回测: 不选选股策略 -> 全市场有日线的股票
+                payload.mode = 'daily';
             }
             this.batch.running = true;
             this.batch.result = null;

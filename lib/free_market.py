@@ -171,3 +171,128 @@ def get_latest_close(stock_code: str) -> Optional[float]:
         return float(tick["lastPrice"]) if tick and tick.get("lastPrice") else None
     except Exception:
         return None
+
+
+# ============================================================
+# 全市场量能 (新浪指数接口)
+# ============================================================
+
+# 上证指数 / 深证综指: 分别代表沪市、深市整体成交; 两者相加 ≈ 沪深两市总成交
+_SINA_INDEX_SYMS = ("s_sh000001", "s_sz399106")
+
+
+def get_market_total_amount() -> Dict[str, float]:
+    """当日沪深两市成交总额(元) -> {sh, sz, total}
+
+    数据源: 新浪 hq.sinajs.cn 指数接口 s_sh000001(上证) / s_sz399106(深证综指)。
+    返回字段: 名称,当前点数,涨跌额,涨跌幅,成交量(手),成交额(万元)。
+    取两市成交额(万元)换算为元; fail-soft: 请求/解析失败抛 FreeMarketError。
+    """
+    url = "https://hq.sinajs.cn/list=" + ",".join(_SINA_INDEX_SYMS)
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": _UA.get("User-Agent", "Mozilla/5.0"),
+            "Referer": "https://finance.sina.com.cn",
+        })
+        with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
+            raw = resp.read()
+    except Exception as err:
+        raise FreeMarketError(f"新浪指数请求失败: {err}") from err
+    for enc in ("utf-8", "gbk"):
+        try:
+            text = raw.decode(enc)
+            break
+        except Exception:
+            continue
+    else:
+        text = raw.decode("utf-8", "ignore")
+
+    amounts: Dict[str, float] = {"sh": 0.0, "sz": 0.0}
+    count = 0
+    for line in text.strip().splitlines():
+        if "=" not in line:
+            continue
+        var = line.split("=", 1)[0].strip()          # var hq_str_s_sh000001
+        sym = var.replace("var hq_str_", "").strip()
+        if sym not in _SINA_INDEX_SYMS:
+            continue
+        body = line.split('="', 1)[1].rsplit('";', 1)[0].strip()
+        fields = body.split(",")
+        # [名称, 点数, 涨跌, 涨跌幅, 成交量(手), 成交额(万元)]
+        if len(fields) < 6 or not fields[5]:
+            continue
+        try:
+            amt_wan = float(fields[5])
+        except ValueError:
+            continue
+        if sym == "s_sh000001":
+            amounts["sh"] = amt_wan * 10000.0
+        elif sym == "s_sz399106":
+            amounts["sz"] = amt_wan * 10000.0
+        count += 1
+
+    if count < 2:
+        raise FreeMarketError("新浪指数无完整返回 (两市成交额)")
+    amounts["total"] = amounts["sh"] + amounts["sz"]
+    return amounts
+
+
+# ============================================================
+# 历史量能 (东财指数K线) -- 用于回补历史交易日
+# ============================================================
+
+# 东财 secid: 上证指数 1.000001 / 深证综指 0.399106 (与新浪指数口径一致)
+_EM_INDEX_SECIDS = (("1.000001", "sh"), ("0.399106", "sz"))
+
+
+def get_market_total_amount_by_date(trade_date: str) -> Dict[str, float]:
+    """指定交易日两市成交总额(元) -> {sh, sz, total}
+
+    数据源: 东财 push2his 指数K线(上证指数/深证综指), amount 字段为当日成交额(元)。
+    用于回补历史日期, 与实时新浪口径一致(已校验 09-10 两源数值相同)。
+    trade_date: 格式 'YYYY-MM-DD' 或 'YYYYMMDD'; 非交易日或数据缺失抛 FreeMarketError。
+    """
+    d = (trade_date or "").replace("-", "")
+    if len(d) != 8:
+        raise FreeMarketError(f"日期格式错误: {trade_date}")
+
+    amounts: Dict[str, float] = {"sh": 0.0, "sz": 0.0}
+    count = 0
+    for secid, key in _EM_INDEX_SECIDS:
+        url = (
+            "https://push2his.eastmoney.com/api/qt/stock/kline/get?"
+            f"secid={secid}&klt=101&fqt=1"
+            "&fields1=f1,f2,f3,f4,f5,f6"
+            "&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"
+            "&beg=20260901&end=20260910"
+        )
+        # 东财对单日/过小区间偶发断连, 固定拉取整段区间再本地过滤目标日, 稳定可靠
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
+                raw = resp.read()
+            payload = json.loads(raw.decode("utf-8"))
+        except Exception as err:
+            raise FreeMarketError(f"东财指数K线失败 {secid}: {err}") from err
+
+        klines = (payload.get("data") or {}).get("klines") or []
+        # kline 列: 日期,开,收,高,低,成交量,成交额,振幅,涨跌幅,涨跌额,换手率
+        matched = None
+        for line in klines:
+            f = line.split(",")
+            if len(f) >= 7 and f[0].replace("/", "-").replace("'", "")[:8] == d:
+                matched = f
+                break
+        if matched is None:
+            raise FreeMarketError(f"东财无 {trade_date} 指数K线: {secid}")
+        try:
+            amt = float(matched[6])
+        except (ValueError, IndexError):
+            raise FreeMarketError(f"东财 {trade_date} 成交额解析失败: {secid}")
+        amounts[key] = amt
+        count += 1
+
+    if count < 2 or amounts["sh"] <= 0 or amounts["sz"] <= 0:
+        raise FreeMarketError(f"东财 {trade_date} 两市成交额数据不完整")
+    amounts["total"] = amounts["sh"] + amounts["sz"]
+    return amounts

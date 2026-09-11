@@ -18,7 +18,8 @@ BIGQMT_REDIS_CONFIG = {
     # The QMT-side server derives this port from the account id. Set it
     # explicitly to skip service discovery; change it if the server logs
     # a different bind port.
-    "zmq": {"connect_address": "tcp://127.0.0.1:15055"},
+    # 2026-09-09: 服务端已配置真实账号 8890809055 -> 绑定 15560+55=15615, 客户端改回 15615.
+    "zmq": {"connect_address": "tcp://127.0.0.1:15615"},
 }
 
 # Reference/history reads go straight to Big QMT's FormulaServer (port

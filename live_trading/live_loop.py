@@ -9,14 +9,13 @@ LiveLoop -- 盘中全自动交易闭环主循环
 
     每分钟循环:
         1. health_check()          检查 miniQMT 连接 + 行情数据完整性
-        2. update_positions()      拉最新持仓 + 当日盈亏
+        2. update_positions()      拉最新持仓 + 当日盈亏 (券商真实持仓)
         3. check_circuit_breaker() 当日亏损是否触发熔断
-        4. evaluate_stop_loss()    持仓股是否触发止损
-        5. evaluate_signals()      候选股是否出现新信号
-        6. risk_check()            风控审批 (Kris 规则)
-        7. place_orders()          下单 (本 CASE live_trading.miniqmt_trader_v2)
-        8. push_summary()          推送告警 (alert_router)
-        9. save_state()            落盘 state (供 CEO 控制台读)
+        4. evaluate_sell()         按策略持仓监控卖出规则, 触发即自动卖出
+                                    (买入归开盘窗口任务 open_buy_window.py)
+        5. place_orders()          下单 (本 CASE live_trading.miniqmt_trader_v2)
+        6. push_summary()          推送告警 (alert_router)
+        7. save_state()            落盘 state (供 CEO 控制台读)
 
 异常处理金字塔:
     L1 数据层异常 -> 跳过本轮, 下轮继续, 不告警 (网络抖动)
@@ -64,6 +63,11 @@ class MarketDataProvider:
         self._bigqmt_next_probe = 0.0
         self._bridge = None  # 缓存可用的桥模块; 不可用时保留 False + 下次重探时间
         self._next_probe = 0.0
+        # 批量 tick 短 TTL 缓存: 同一批代码在 4s 内复用, 避免每 5s 轮询重复串行走多数据源
+        self._ttl_cache_key = None
+        self._ttl_cache = {}
+        self._ttl_cache_ts = 0.0
+        self._ttl_secs = 4.0
 
     def _bigqmt_provider(self):
         """懒加载 BigQMT 桥客户端。探测节流 30s。返回 None 表示当前不可用。"""
@@ -118,34 +122,68 @@ class MarketDataProvider:
 
     def get_latest_tick(self, stock_code: str) -> dict:
         """拉最新 tick: BigQMT 桥 -> 免费公网 (腾讯) -> xtdata"""
+        ticks = self.get_full_ticks([stock_code])
+        return ticks.get(stock_code, {})
+
+    def get_full_ticks(self, codes: List[str]) -> dict:
+        """批量拉最新 tick: TTL 缓存 -> BigQMT 桥 -> 桥 -> 免费公网 -> xtdata.
+        返回 {code: tick}, 每个 code 取最先成功的 source. 同一批代码在短 TTL 内直接复用缓存,
+        避免 5s 轮询重复串行走多数据源拖慢; RPC 源失败立即失效, 下次探测跳过, 避免连续超时卡顿."""
+        import time as _t
+        if not codes:
+            return {}
+        now = _t.time()
+        key = tuple(sorted(codes))
+        if self._ttl_cache_key == key and (now - self._ttl_cache_ts) < self._ttl_secs:
+            return {c: self._ttl_cache[c] for c in codes if c in self._ttl_cache}
+        out: dict = {}
+        remain = list(codes)
         bigqmt = self._bigqmt_provider()
         if bigqmt:
             try:
-                ticks = bigqmt.get_full_tick([stock_code])
-                t = ticks.get(stock_code)
-                if t:
-                    return t
+                ticks = bigqmt.get_full_tick(remain)
+                for c in remain:
+                    if ticks.get(c):
+                        out.setdefault(c, ticks[c])
             except Exception:
-                pass
-        bridge = self._bridge_provider()
-        if bridge:
+                self._bigqmt = None  # RPC 失败 -> 立即失效, 下次重探 (避免连续 RPC 超时)
+        remain = [c for c in codes if c not in out]
+        if remain:
+            bridge = self._bridge_provider()
+            if bridge:
+                try:
+                    ticks = bridge.get_full_tick(remain)
+                    for c in remain:
+                        if ticks.get(c):
+                            out.setdefault(c, ticks[c])
+                except Exception:
+                    self._bridge = None  # 桥失败 -> 立即失效, 下次重探
+        remain = [c for c in codes if c not in out]
+        if remain:
             try:
-                ticks = bridge.get_full_tick([stock_code])
-                return ticks.get(stock_code, {})
+                from lib import free_market
+                ticks = free_market.get_latest_ticks(remain)
+                for c in remain:
+                    if ticks.get(c):
+                        out.setdefault(c, ticks[c])
             except Exception:
                 pass
-        try:
-            from lib import free_market
-            ticks = free_market.get_latest_ticks([stock_code])
-            if ticks.get(stock_code):
-                return ticks[stock_code]
-        except Exception:
-            pass
-        from xtquant import xtdata
-        if not self._connected:
-            self.connect()
-        ticks = xtdata.get_full_tick([stock_code])
-        return ticks.get(stock_code, {})
+        remain = [c for c in codes if c not in out]
+        if remain:
+            try:
+                from xtquant import xtdata
+                if not self._connected:
+                    self.connect()
+                ticks = xtdata.get_full_tick(remain)
+                for c in remain:
+                    if ticks.get(c):
+                        out.setdefault(c, ticks[c])
+            except Exception:
+                pass
+        self._ttl_cache_key = key
+        self._ttl_cache = dict(out)
+        self._ttl_cache_ts = now
+        return out
 
     def get_recent_kline(self, stock_code: str, period: str = "5m",
                         count: int = 50) -> Optional[Any]:
@@ -205,36 +243,6 @@ class MarketDataProvider:
             return df
         except Exception:
             return None
-
-
-# ============================================================
-# 信号评估 (简化版 MACD)
-# ============================================================
-
-def evaluate_macd_signal(df) -> str:
-    """
-    评估 MACD 信号
-    返回: "buy" / "sell" / "hold"
-    """
-    import pandas as pd
-    if df is None or len(df) < 30:
-        return "hold"
-    close = df["close"].astype(float)
-    ema12 = close.ewm(span=12, adjust=False).mean()
-    ema26 = close.ewm(span=26, adjust=False).mean()
-    dif = ema12 - ema26
-    dea = dif.ewm(span=9, adjust=False).mean()
-
-    # 最新两根: 看是否金叉/死叉
-    if len(dif) < 2:
-        return "hold"
-    prev = dif.iloc[-2] - dea.iloc[-2]
-    curr = dif.iloc[-1] - dea.iloc[-1]
-    if prev <= 0 and curr > 0:
-        return "buy"
-    if prev >= 0 and curr < 0:
-        return "sell"
-    return "hold"
 
 
 # ============================================================
@@ -346,6 +354,13 @@ class LiveTradingLoop:
         # 真实交易用: trader 单例复用 + 心跳 + 自动重连 (实测可下单选走 BigQMT 桥)
         self._trader = None
         self._trader_lock = threading.Lock()
+        # 券商实时可用数量 {code: can_use_volume} (T+1): 卖出监控封顶卖出数量;
+        # None = 本轮券商持仓同步失败 (未知), 不盲卖
+        self._broker_avail: Optional[Dict[str, int]] = None
+        # 当日已尝试卖出的 "strategy|code" 集合 (跨天自动清空):
+        # 防止 T+1 冻结/下单失败导致每 60 秒重复评估+告警刷屏
+        self._sell_attempt_day: str = ""
+        self._sell_attempts: set = set()
 
         # 初始化 state
         s = self.state_store.load()
@@ -417,94 +432,32 @@ class LiveTradingLoop:
             self.state_store.save(s)
             return {"action": "circuit_breaker"}
 
-        # 4) 评估信号 (新模型: 每个启用策略只评估自己的选股池+持仓, 互不影响, 无 default 兜底)
-        new_signals = []
-        if self.per_strategy_mode:
-            from lib.selection_engine import iter_strategy_signal_targets
-            from lib.strategy_registry import get_strategy
-            for sname, code in iter_strategy_signal_targets():
-                meta = get_strategy(sname)
-                if meta is None:
-                    continue
-                try:
-                    result = meta.evaluator(code, self.market, self.capital)
-                except Exception as e:
-                    self.alert.alert("WARN", f"{sname} 策略评估异常 {code}",
-                                     message=str(e), source="zoe")
-                    continue
-                if not result:
-                    continue
-                side = result.get("side", "hold")
-                if side == "hold":
-                    continue
-                new_signals.append({
-                    "code": code, "side": side,
-                    "strategy": sname, "reason": result.get("reason", ""),
-                })
-        else:
-            for code in self.watch_stocks:
-                if self.signal_evaluator is not None:
-                    # 传统外部注入的信号路由器: 由 evaluator 自己决定用哪个策略
-                    try:
-                        result = self.signal_evaluator(code, self.market, self.capital)
-                    except Exception as e:
-                        self.alert.alert("WARN", f"signal_evaluator 异常 {code}",
-                                         message=str(e), source="zoe")
-                        continue
-                    if not result:
-                        continue
-                    side = result.get("side", "hold")
-                    if side == "hold":
-                        continue
-                    sig = {
-                        "code":     code,
-                        "side":     side,
-                        "strategy": result.get("strategy", "unknown"),
-                        "reason":   result.get("reason", ""),
-                    }
-                else:
-                    df = self.market.get_recent_kline(code, period="5m", count=50)
-                    side = evaluate_macd_signal(df)
-                    if side == "hold":
-                        continue
-                    sig = {"code": code, "side": side, "strategy": "macd_5min"}
-                new_signals.append(sig)
-
-        # 注意: signals / orders / events 都先攒在内存 s 里, 第 6 步统一一次 save 落盘
-        # -- 不能用 append_signal / append_order, 否则它们 load->改->save, 会被第 6 步的
-        # save(s) 用旧快照整体覆盖回去, 导致 signals / orders 写完即丢
+        # 4) 卖出监控 -- 主循环按"选取该股票的策略"的卖出规则持续监控持仓:
+        #    每轮把策略持仓逐只交给该策略的评估器, 触发 sell 信号即自动卖出
+        #    (卖出数量 = 策略持仓量, 受券商可用数量 T+1 封顶)。
+        #    买入不在此处执行 (评估到 buy 一律忽略): 买入归开盘买入窗口任务
+        #    (live_trading/open_buy_window.py, 09:00:02-09:39:00 每 30 秒)。
+        new_signals: List[dict] = []
+        new_orders: List[dict] = []
+        try:
+            new_signals, new_orders = self._evaluate_and_sell(s)
+        except Exception as e:
+            self.alert.alert("WARN", "主循环卖出评估异常",
+                             message=f"{type(e).__name__}: {e}", source="loop")
         if new_signals:
-            s["signals"] = s.get("signals", [])
-            for sig in new_signals:
-                s["signals"].append({
-                    **sig,
-                    "ts": datetime.now().isoformat(timespec="seconds"),
-                })
-                self.alert.alert(
-                    "INFO", f"信号触发 -> {sig['side']} {sig['code']} [{sig.get('strategy','')}]",
-                    source="zoe",
-                )
+            s["signals"] = (s.get("signals") or []) + new_signals
             s["signals"] = s["signals"][-100:]
+        if new_orders:
+            s["orders"] = (s.get("orders") or []) + new_orders
+            s["orders"] = s["orders"][-200:]
 
-        # 5) 风控 + 下单
-        s["orders"] = s.get("orders", [])
-        for sig in new_signals:
-            order_result = self._handle_signal(s, sig)
-            # 把触发该订单的策略名一起记录, 便于复盘
-            if "strategy" not in order_result and sig.get("strategy"):
-                order_result["strategy"] = sig["strategy"]
-            s["orders"].append({
-                **order_result,
-                "ts": datetime.now().isoformat(timespec="seconds"),
-            })
-        s["orders"] = s["orders"][-100:]
-
-        # 6) 落盘 state (本轮所有改动: positions/today_pnl/pnl_history/health/signals/orders/events 一锅端)
+        # 5) 落盘 state (本轮所有改动: positions/today_pnl/pnl_history/health/events 一锅端)
         s["events"] = s.get("events", [])
         s["events"].append({
             "ts": datetime.now().isoformat(timespec="seconds"),
             "type": "loop_cycle",
             "signal_count": len(new_signals),
+            "order_count":  len(new_orders),
             "duration_ms": int((time.time() - cycle_start) * 1000),
         })
         s["events"] = s["events"][-200:]
@@ -514,7 +467,92 @@ class LiveTradingLoop:
             "action":      "cycle_done",
             "duration_ms": int((time.time() - cycle_start) * 1000),
             "new_signals": len(new_signals),
+            "new_orders":  len(new_orders),
         }
+
+    # ------------------------------------------------------------------
+    # 卖出监控 (主循环每轮): 按策略持仓的卖出规则持续监控
+    # ------------------------------------------------------------------
+    def _evaluate_and_sell(self, state: dict) -> tuple:
+        """按策略持仓监控卖出规则: 每轮对 trade_strategy_position 里 volume>0 的
+        每条持仓, 调"选取该股票的策略"的评估器; 触发 sell 信号即按持仓量自动卖出。
+
+        规则:
+        - 卖出数量 = min(策略持仓量, 券商可用数量) 向下取整到 100 股一手 (T+1 封顶)
+        - buy 信号一律忽略 (买入归开盘买入窗口任务 open_buy_window.py)
+        - 券商可用数量未知 (本轮持仓同步失败) -> 不盲卖, 等下一轮
+        - 同一 (策略, 股票) 当日只尝试一次卖出: 防止 T+1 冻结/下单失败
+          每 60 秒重复评估+告警刷屏; 跨天自动重置 (次日继续监控)
+
+        返回 (signals, orders): 新卖出信号列表 + 下单/跳过结果列表。
+        """
+        from lib.selection_store import query_strategy_positions
+        from lib.strategy_registry import get_strategy
+
+        try:
+            positions = [p for p in query_strategy_positions()
+                         if int(p.get("volume") or 0) > 0]
+        except Exception as e:
+            self.alert.alert("WARN", "策略持仓查询失败, 本轮卖出监控跳过",
+                             message=str(e), source="loop")
+            return [], []
+        if not positions:
+            return [], []
+        if self._broker_avail is None:
+            # 券商持仓本轮未知: 不盲卖, 等下一轮同步成功后再评估
+            return [], []
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        if self._sell_attempt_day != today:
+            self._sell_attempt_day = today
+            self._sell_attempts = set()
+
+        signals: List[dict] = []
+        orders: List[dict] = []
+        for pos in positions:
+            strategy = str(pos.get("strategy") or "").strip()
+            code = str(pos.get("stock_code") or "").strip()
+            hold_vol = int(pos.get("volume") or 0)
+            if not strategy or not code or hold_vol <= 0:
+                continue
+            if f"{strategy}|{code}" in self._sell_attempts:
+                continue
+            meta = get_strategy(strategy)
+            if meta is None:
+                continue   # 策略未注册 (无评估器), 跳过
+            try:
+                result = meta.evaluator(code, self.market, self.capital)
+            except Exception as e:
+                self.alert.alert("WARN", f"卖出评估异常 {strategy} {code}",
+                                 message=f"{type(e).__name__}: {e}", source="loop")
+                continue
+            if not result or result.get("side") != "sell":
+                continue   # hold 不动; buy 一律忽略 (买入归开盘窗口任务)
+
+            self._sell_attempts.add(f"{strategy}|{code}")
+            sig = {"code": code, "side": "sell", "strategy": strategy,
+                   "name": pos.get("name") or "",
+                   "reason": result.get("reason", "")}
+            signals.append({**sig, "ts": datetime.now().isoformat(timespec="seconds")})
+
+            can_use = int(self._broker_avail.get(code) or 0)
+            if can_use <= 0:
+                self.alert.alert("INFO", f"卖出信号 {code} 暂无法执行",
+                                 message="券商可用持仓为 0 (T+1 当日买入冻结或无持仓)",
+                                 source="loop")
+                orders.append({**sig, "status": "skipped",
+                               "reason": "T+1 冻结或券商无可用持仓",
+                               "ts": datetime.now().isoformat(timespec="seconds")})
+                continue
+            sell_qty = min(hold_vol, can_use)
+            lot_qty = sell_qty // 100 * 100
+            if lot_qty < 100:
+                orders.append({**sig, "status": "skipped",
+                               "reason": f"可卖数量 {sell_qty} 股不足一手",
+                               "ts": datetime.now().isoformat(timespec="seconds")})
+                continue
+            orders.append(self._handle_signal(state, sig, quantity=lot_qty))
+        return signals, orders
 
     def _get_trader(self):
         """返回真实交易账号的单例 trader (BigQMT 桥, 心跳+自动重连)。首次调用才连接。"""
@@ -649,7 +687,9 @@ class LiveTradingLoop:
         """对接国金证券真实持仓: 用 miniQMT 查询真实持仓覆盖 state.positions.
 
         返回持仓列表 (含 cur_price/market_value/pnl/pnl_pct); 查询失败返回 None (调用方回退内存持仓)。
+        同时更新 self._broker_avail (券商实时可用数量, T+1), 供主循环卖出监控封顶卖出数量。
         """
+        self._broker_avail = None   # 每轮先置未知, 同步成功后再更新
         try:
             trader = self._get_trader()
         except Exception as e:
@@ -661,6 +701,11 @@ class LiveTradingLoop:
             raw = trader.query_positions()
             if raw is None:
                 return None
+            # 券商实时可用数量 {code: can_use_volume} (T+1): 卖出监控用
+            self._broker_avail = {
+                str(p.get("stock_code") or ""): int(p.get("can_use_volume") or 0)
+                for p in raw
+            }
             # 查询国金真实资产 (总资产/现金/市值); 仅当返回有效正资产才覆盖, 避免休市返回 0 误覆盖
             asset = trader.query_asset()
             if asset:

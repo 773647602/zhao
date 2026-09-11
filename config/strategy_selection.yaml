@@ -17,10 +17,15 @@ strategies:
     sort_desc: true
     filters:
       max_prev_pct: 0
-      min_open_pct: 3
-      min_vol_grow_pct: 4
+      max_prev_open_pct: 3
+      min_open_pct: 2
+      min_vol_grow_pct: 10
       ma_period: 10
-      max_index_pct: null
+      max_index_pct: 0.5
+      exclude_chinext: false
+      exclude_star: false
+      max_prev_up_count: 3500
+      min_prev_market_amount: null
   trade:
     enabled: true
     buy:
@@ -28,9 +33,47 @@ strategies:
       open_pct_min: null
       dip_pct: 3
       recover_pct: 0.2
-      plunge_pct: 2
-      rebound_pct: 1
+      plunge_pct: 2.5
+      rebound_pct: 0.6
       open_pct_max: 6
+      no_buy_up_pct: 0
+      max_percent: 20
+      max_enabled: false
+      qty: 100
+      qty_enabled: true
+      max_daily: 10
     sell:
       take_profit_pct: 110
       stop_loss_pct: -100
+- name: grid_classic
+  label: 超跌反弹
+  enabled: false
+  schedule: 08:00
+  universe: all_a
+  lookback_days: 60
+  top_n: 20
+  selection:
+    mode: generic_filter
+    filters:
+      exclude_chinext: null
+      exclude_star: null
+      min_prev_market_amount: null
+  trade:
+    enabled: true
+    buy:
+      open_pct_min: null
+      open_pct_max: 6
+      mode: hook
+      dip_pct: 2
+      recover_pct: 0.5
+      plunge_pct: 2.5
+      rebound_pct: 0.6
+      no_buy_up_pct: null
+      max_percent: null
+      max_enabled: false
+      qty: 200
+      qty_enabled: true
+      max_daily: 3
+    sell:
+      take_profit_pct: 115
+      stop_loss_pct: -8

@@ -92,7 +92,6 @@ api.include_router(live.router,      prefix="/api/live",     tags=["live"])
 api.include_router(review.router,    prefix="/api/review",   tags=["review"])
 api.include_router(sys_route.router, prefix="/api/system",   tags=["system"])
 api.include_router(backtest.router,  prefix="/api/backtest", tags=["backtest"])
-# api.include_router(dragon.router,    prefix="/api/dragon",   tags=["dragon"])  # dragon_strategy 模块暂不存在
 api.include_router(qmt_config.router, prefix="/api/qmt",     tags=["qmt"])
 api.include_router(strategy_page.router, prefix="/api/strategy", tags=["strategy"])
 api.include_router(data_page.router, prefix="/api/data", tags=["data"])
@@ -217,6 +216,103 @@ def _start_selection_scheduler():
             except Exception as e:
                 print(f"[strategy] 定时选股 {name} 异常: {type(e).__name__}: {e}", flush=True)
 
+    # 昨日全市场量能阈值 (元): 高于此值才把当日选股池候选推入监控池
+    # 实际值在 _push_watchpool_job 运行时动态读取界面配置 (config/pool_config.yaml), 缺省 2 万亿
+    WATCH_POOL_MIN_MARKET_AMOUNT = 2.0e12  # 默认 2 万亿
+
+    def _push_watchpool_job():
+        """09:28 定时: 按昨日市场量能决定把哪批选股池候选推入监控池.
+
+        选股完成后自动入监控池已取消, 统一由本任务驱动:
+          - 昨日量能 > 阈值  → 推入「当日」选股池候选 (今天能开盘买);
+          - 昨日量能 <= 阈值 → 推入「昨日」选股池候选, 且仅限「昨日收盘价 < 昨日开盘价」(阴线/低走)
+            且「昨日涨幅 > -5%」(跌幅不超过5%) 的股票 —— 量能不足时退而求其次买昨日回调但未大跌的候选。
+        """
+        import pymysql
+        # 运行时读取界面配置的昨日量能阈值 (万亿 -> 元), 缺省 2 万亿
+        try:
+            from lib.pool_config import load_min_market_amount_yuan, load_min_market_yi
+            _threshold = load_min_market_amount_yuan()
+            _yi = load_min_market_yi()
+        except Exception:
+            _threshold = WATCH_POOL_MIN_MARKET_AMOUNT
+            _yi = 2.0
+        today = datetime.now().strftime("%Y-%m-%d")
+        try:
+            from lib.selection_store import (
+                _db_config, query_selection_pool, sync_pool_to_watch_pool,
+            )
+            cfg = _db_config()
+            conn = pymysql.connect(connect_timeout=5, read_timeout=15, **cfg)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT trade_date, total_amount FROM trade_market_volume "
+                        "WHERE trade_date < %s ORDER BY trade_date DESC LIMIT 1",
+                        (today,),
+                    )
+                    row = cur.fetchone()
+                prev_date = str(row[0]) if row else None
+                amount = float(row[1]) if row and row[1] is not None else None
+                # 昨日阴线集合: 昨日收盘价 < 昨日开盘价 (阴线), 且昨日涨幅 > 下限(防跌太狠) (从日线表取)
+                yin_codes = None
+                if prev_date:
+                    # 昨日涨幅 = 昨日收盘 / 前一日收盘 - 1; 需 join 前一日收盘价 (trade_date < 昨日的最大交易日)
+                    # 下限 (昨日阴线候选的涨幅下限 %) 从选股池界面配置读取
+                    from lib.pool_config import load_prev_drop_min_pct
+                    prev_drop_min = load_prev_drop_min_pct() / 100.0
+                    with conn.cursor() as cur2:
+                        cur2.execute(
+                            "SELECT DISTINCT a.stock_code FROM trade_stock_daily a "
+                            "JOIN trade_stock_daily b "
+                            "  ON b.stock_code = a.stock_code "
+                            " AND b.trade_date = (SELECT MAX(t2.trade_date) FROM trade_stock_daily t2 "
+                            "                     WHERE t2.stock_code = a.stock_code "
+                            "                       AND t2.trade_date < %s) "
+                            "WHERE a.trade_date = %s "
+                            "  AND a.close_price < a.open_price "
+                            "  AND b.close_price > 0 "
+                            "  AND (a.close_price / b.close_price - 1.0) > %s",
+                            (prev_date, prev_date, prev_drop_min),
+                        )
+                        yin_codes = {str(r[0]) for r in cur2.fetchall()}
+            finally:
+                conn.close()
+
+            # 分支一: 量能充足 (>阈值万亿) → 推当日选股候选
+            if amount is not None and amount > _threshold:
+                rows = query_selection_pool() or []
+                today_rows = [r for r in rows
+                              if (str(r.get("selected_at") or "")[:10] == today
+                                  or str(r.get("trade_date") or "")[:10] == today)]
+                codes = [str(r["stock_code"]) for r in today_rows]
+                if not codes:
+                    print("[watch_pool] @09:28 当日选股池无候选, 不推送", flush=True)
+                    return
+                added = sync_pool_to_watch_pool(codes)
+                print(f"[watch_pool] @09:28 量能充足({amount}元, 阈值{_yi}万亿), 推入当日候选 "
+                      f"{len(added)} 只; 共 {len(codes)} 只", flush=True)
+                return
+
+            # 分支二: 量能不足 (<=阈值万亿) → 推昨日选股候选, 且需昨日收盘<开盘
+            if not prev_date:
+                print("[watch_pool] @09:28 无昨日量能数据, 不推送", flush=True)
+                return
+            prev_rows = query_selection_pool(trade_date=prev_date) or []
+            codes = [str(r["stock_code"]) for r in prev_rows
+                     if str(r["stock_code"]) in (yin_codes or set())]
+            if not codes:
+                print(f"[watch_pool] @09:28 量能不足({amount}元, 阈值{_yi}万亿), "
+                      f"昨日({prev_date})候选 {len(prev_rows)} 只, 无满足昨日收<开者, 不推送",
+                      flush=True)
+                return
+            added = sync_pool_to_watch_pool(codes)
+            print(f"[watch_pool] @09:28 量能不足({amount}元, 阈值{_yi}万亿), 推入昨日({prev_date})阴线候选 "
+                  f"{len(added)} 只; 符合 {len(codes)} 只 / 昨日候选 {len(prev_rows)} 只",
+                  flush=True)
+        except Exception as e:
+            print(f"[watch_pool] @09:28 推送异常: {type(e).__name__}: {e}", flush=True)
+
     sched = BackgroundScheduler(timezone="Asia/Shanghai")
     sched.add_job(
         _job,
@@ -224,6 +320,13 @@ def _start_selection_scheduler():
                             timezone="Asia/Shanghai"),
         id="selection_per_minute",
         name="策略按各自选股时间触发",
+    )
+    sched.add_job(
+        _push_watchpool_job,
+        trigger=CronTrigger(hour=9, minute=28, second=0, day_of_week="mon-fri",
+                            timezone="Asia/Shanghai"),
+        id="push_selection_to_watch_pool",
+        name="09:28 选股池候选按量能条件推入监控池",
     )
     sched.start()
     print("[strategy] 定时选股已启动: 每分钟检查, 各策略按自身 schedule 触发 (周一至周五)", flush=True)

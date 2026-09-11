@@ -54,26 +54,29 @@ def strategy_schedule_set(payload: Dict[str, Any] = Body(default={})):
 
 
 @router.get("/weaktest/config")
-def weaktest_config():
-    """弱转强测试: 当前 weak_to_strong 实例的筛选阈值 + 买卖条件配置"""
+def weaktest_config(name: str = "weak_to_strong"):
+    """读取指定策略实例 (默认 weak_to_strong) 的筛选阈值 + 买卖条件配置.
+    供「选股条件/买入条件/买入仓位管理/卖出条件」四区块共用 (weak_to_strong 与 grid_classic 等)."""
     cfg = load_selection_config()
-    inst = next((s for s in cfg.get("strategies", []) if s.get("name") == "weak_to_strong"), None)
+    inst = next((s for s in cfg.get("strategies", []) if s.get("name") == name), None)
     filters = ((inst or {}).get("selection") or {}).get("filters", {}) or {} if inst else {}
     trade = (inst or {}).get("trade", {}) or {}
     return {
         "ok": True,
-        "label": (inst or {}).get("label", "弱转强"),
+        "label": (inst or {}).get("label", name),
         "enabled": bool(inst and inst.get("enabled")),
         "filters": filters,
         "trade": trade,
     }
 
 
-_WEAK_FILTER_KEYS = ("max_prev_pct", "min_open_pct", "min_vol_grow_pct",
-                     "ma_period", "max_index_pct")
+_WEAK_FILTER_KEYS = ("max_prev_pct", "max_prev_open_pct", "min_open_pct", "min_vol_grow_pct",
+                     "ma_period", "max_index_pct", "exclude_chinext", "exclude_star",
+                     "max_prev_up_count", "min_prev_market_amount")
 
 _TRADE_BUY_KEYS = ("open_pct_min", "open_pct_max", "mode", "dip_pct", "recover_pct",
-                   "plunge_pct", "rebound_pct", "no_buy_up_pct")
+                   "plunge_pct", "rebound_pct", "no_buy_up_pct",
+                   "max_percent", "max_enabled", "qty", "qty_enabled", "max_daily")
 _TRADE_SELL_KEYS = ("take_profit_pct", "stop_loss_pct")
 
 
@@ -100,21 +103,23 @@ def _merge_weak_trade(old: dict, given: dict) -> dict:
 
 @router.post("/weaktest/config")
 def weaktest_config_set(payload: Dict[str, Any] = Body(default={})):
-    """保存弱转强筛选条件 + 买卖条件 -> strategy_selection.yaml
-    payload: {"filters": {...}, "trade": {"enabled": true, "buy": {...}, "sell": {...}}}
+    """保存指定策略实例 (默认 weak_to_strong) 筛选条件 + 买卖条件 -> strategy_selection.yaml
+    payload: {"name": "grid_classic", "filters": {...}, "trade": {"enabled": true, "buy": {...}, "sell": {...}}}
     filters/trade 中 null=禁用该项目; 前端未传的键保留 yaml 原值
+    供「选股条件/买入条件/买入仓位管理/卖出条件」四区块共用 (weak_to_strong 与 grid_classic 等).
     """
     from lib.strategy_runner import save_selection_config
+    name = (payload or {}).get("name") or "weak_to_strong"
     given = (payload or {}).get("filters") or {}
     cfg = load_selection_config()
     # 前端未传的键保留 yaml 原值, 避免漏传导致参数被清空 (null=明确禁用)
     old = dict(((next((s for s in cfg.get("strategies", [])
-                        if s.get("name") == "weak_to_strong"), None) or {}).get("selection") or {}).get("filters") or {})
+                        if s.get("name") == name), None) or {}).get("selection") or {}).get("filters") or {})
     clean = {k: (given[k] if k in given else old.get(k)) for k in _WEAK_FILTER_KEYS}
     insts = cfg.get("strategies", [])
-    inst = next((s for s in insts if s.get("name") == "weak_to_strong"), None)
+    inst = next((s for s in insts if s.get("name") == name), None)
     if inst is None:
-        inst = {"name": "weak_to_strong", "label": "弱转强", "enabled": True,
+        inst = {"name": name, "label": name, "enabled": True,
                 "universe": "all_a", "lookback_days": 20, "top_n": 20,
                 "selection": {"mode": "generic_filter", "filters": {},
                               "sort_by": "amount", "sort_desc": True}}
@@ -126,7 +131,7 @@ def weaktest_config_set(payload: Dict[str, Any] = Body(default={})):
         save_selection_config(cfg)
     except Exception as e:
         return {"ok": False, "message": f"保存失败: {type(e).__name__}: {e}"}
-    return {"ok": True, "message": "弱转强筛选与买卖条件已保存",
+    return {"ok": True, "message": f"{name} 筛选与买卖条件已保存",
             "filters": clean, "trade": inst["trade"]}
 
 
@@ -200,6 +205,17 @@ def strategy_list():
     instances = {s.get("name"): s for s in sel_cfg.get("strategies", [])}
     groups = list_groups()
     flat = list_strategies()
+    # yaml 中额外多出的实例(如复制的策略副本)即使未在 registry 注册也展示在列表, 用实例自身 label
+    registered = {s["name"] for s in flat}
+    for inst_name, inst in instances.items():
+        if inst_name not in registered:
+            flat.append({
+                "name": inst_name,
+                "label": inst.get("label") or inst_name,
+                "group": inst.get("group", "自定义策略"),
+                "category": inst.get("label") or inst_name,
+                "description": "自选股策略实例 (配置文件复制)",
+            })
     by_strategy = get_selection_state().get("by_strategy", {}) or {}
     flat_with_status = []
     for s in flat:
@@ -256,7 +272,7 @@ def strategy_params_get(strategy: str):
 def strategy_params_set(payload: Dict[str, Any] = Body(...)):
     """保存策略参数覆盖值 -> config/strategy_params.json, 即时生效
 
-    payload: {"strategy": "macd_1d", "values": {"fast": 12, "slow": 26, "signal": 9}}
+    payload: {"strategy": "grid_classic", "values": {"window": 20}}
     """
     name = payload.get("strategy")
     values = payload.get("values", {}) or {}
